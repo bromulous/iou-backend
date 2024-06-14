@@ -32,6 +32,49 @@ dummy_user = {"id": 0, "name": "Sam", "balances": {}}
 users[0] = dummy_user
 current_user_id = 0
 
+class LauncherBondContract:
+    def __init__(self):
+        self.bonds = {}
+        self.bond_counter = 1
+        self.multi_sig_owners = set()
+        self.multi_sig_threshold = 2  # Example threshold
+        self.pending_approvals = {}
+
+    def add_multi_sig_owner(self, owner):
+        self.multi_sig_owners.add(owner)
+
+    def remove_multi_sig_owner(self, owner):
+        self.multi_sig_owners.discard(owner)
+
+    def create_bond_contract(self, name, symbol, total_supply, issuer, interest_rate, maturity_date, payment_schedule, is_callable=False, is_convertible=False, penalty_rate=0, requires_full_sale=True, early_withdrawal=False):
+        bond_id = self.bond_counter
+        self.bond_counter += 1
+        bond_contract = BondContract(name, symbol, total_supply, issuer, interest_rate, maturity_date, payment_schedule, is_callable, is_convertible, penalty_rate, requires_full_sale, early_withdrawal)
+        self.bonds[bond_id] = bond_contract
+        return bond_id, bond_contract
+
+    def halt_withdrawals(self, bond_id, owner):
+        if owner not in self.multi_sig_owners:
+            raise PermissionError("Only multi-sig owners can halt withdrawals.")
+        if bond_id not in self.pending_approvals:
+            self.pending_approvals[bond_id] = set()
+        self.pending_approvals[bond_id].add(owner)
+        if len(self.pending_approvals[bond_id]) >= self.multi_sig_threshold:
+            bond = self.bonds[bond_id]
+            bond.withdrawals_halted = True
+            return True
+        return False
+
+    def stop_bond_issuance(self, owner):
+        if owner not in self.multi_sig_owners:
+            raise PermissionError("Only multi-sig owners can stop bond issuance.")
+        self.bond_issuance_stopped = True
+
+
+#Launcher Contract Instance
+launcher_contract = LauncherBondContract()
+launcher_contract.add_multi_sig_owner(0)
+
 # Classes for ERC20Token and Bond operations
 class ERC20Token:
     def __init__(self, id, name, symbol, total_supply):
@@ -91,6 +134,8 @@ class BondContract(ERC20Token):
         self.auction_active = False
         self.approved_payees = set([self.issuer])
         self.reentrancy_guard = False
+        self.withdrawals_halted = False
+
 
     def only_issuer(func):
         def wrapper(self, *args, **kwargs):
@@ -421,19 +466,65 @@ def issue_bond(user_id: int, bond_request: IssueBondRequest):
     global bond_counter
     if user_id not in users:
         raise HTTPException(status_code=404, detail="User not found")
-    bond_id = bond_counter
-    bond_counter += 1
-    bond = bond_request.dict()
-    bond.update({
+    if main_contract.bond_issuance_stopped:
+        raise HTTPException(status_code=403, detail="Bond issuance has been halted")
+    
+    bond_id, bond_contract = main_contract.create_bond_contract(
+        bond_request.name,
+        bond_request.symbol,
+        bond_request.total_supply,
+        user_id,
+        bond_request.interest_rate,
+        bond_request.maturity_date,
+        bond_request.payment_schedule,
+        bond_request.is_callable,
+        bond_request.is_convertible,
+        bond_request.penalty_rate,
+        bond_request.requires_full_sale,
+        bond_request.early_withdrawal
+    )
+    
+    bonds[bond_id] = {
         "id": bond_id,
+        "name": bond_request.name,
+        "symbol": bond_request.symbol,
+        "total_supply": bond_request.total_supply,
         "issuer": user_id,
+        "interest_rate": bond_request.interest_rate,
+        "maturity_date": bond_request.maturity_date,
+        "payment_schedule": bond_request.payment_schedule,
+        "is_callable": bond_request.is_callable,
+        "is_convertible": bond_request.is_convertible,
+        "penalty_rate": bond_request.penalty_rate,
+        "requires_full_sale": bond_request.requires_full_sale,
+        "early_withdrawal": bond_request.early_withdrawal,
         "auction_price": bond_request.total_supply,
         "auction_end_time": None,
         "bond_sold": False,
         "auction_active": False
-    })
-    bonds[bond_id] = bond
-    return bond
+    }
+    
+    return bonds[bond_id]
+
+@app.post("/multi_sig/halt_withdrawals/{bond_id}")
+def halt_withdrawals(bond_id: int, user_id: int):
+    if user_id not in users:
+        raise HTTPException(status_code=404, detail="User not found")
+    if bond_id not in bonds:
+        raise HTTPException(status_code=404, detail="Bond not found")
+    
+    halted = launcher_contract.halt_withdrawals(bond_id, user_id)
+    if halted:
+        return {"message": "Withdrawals halted successfully"}
+    return {"message": "Halt withdrawals approval recorded"}
+
+@app.post("/multi_sig/stop_bond_issuance")
+def stop_bond_issuance(user_id: int):
+    if user_id not in users:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    launcher_contract.stop_bond_issuance(user_id)
+    return {"message": "Bond issuance stopped"}
 
 @app.post("/users/{user_id}/save_draft", response_model=Dict)
 def save_draft(user_id: int, draft_request: SaveDraftRequest):
