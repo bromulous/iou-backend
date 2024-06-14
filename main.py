@@ -23,6 +23,7 @@ app.add_middleware(
 users = {}
 tokens = {}
 bonds = {}
+projects = {}
 bond_counter = 1
 user_counter = 1
 current_user_id = None
@@ -33,7 +34,8 @@ current_user_id = 0
 
 # Classes for ERC20Token and Bond operations
 class ERC20Token:
-    def __init__(self, name, symbol, total_supply):
+    def __init__(self, id, name, symbol, total_supply):
+        self.id = id
         self.name = name
         self.symbol = symbol
         self.total_supply = total_supply
@@ -87,7 +89,7 @@ class BondContract(ERC20Token):
         self.erc20_token = None  # Token used for payment (e.g., FRAX)
         self.bond_sold = False
         self.auction_active = False
-        self.approved_payees = set(self.issuer)
+        self.approved_payees = set([self.issuer])
         self.reentrancy_guard = False
 
     def only_issuer(func):
@@ -170,12 +172,6 @@ class BondContract(ERC20Token):
         if self.issuer == issuer:
             self.approved_payees.add(payee)
 
-    def allocate_payment(self, payee, amount, payment_time):
-        if payee in self.approved_payees:
-            if payment_time not in self.payments:
-                self.payments[payment_time] = 0
-            self.payments[payment_time] += amount
-
     def convert_to_shares(self, holder, conversion_rate, shares_contract):
         if self.is_convertible:
             num_shares = self.balances[holder] * conversion_rate
@@ -206,6 +202,12 @@ class Token(BaseModel):
     total_supply: float
     balances: Dict[int, float] = {}
 
+class PaymentScheduleItem(BaseModel):
+    days: int
+    months: int
+    years: int
+    amount: float
+
 class Bond(BaseModel):
     id: int
     name: str
@@ -214,7 +216,7 @@ class Bond(BaseModel):
     issuer: int
     interest_rate: float
     maturity_date: datetime.date
-    payment_schedule: str
+    payment_schedule: List[PaymentScheduleItem]
     is_callable: bool
     is_convertible: bool
     penalty_rate: float
@@ -231,7 +233,7 @@ class IssueBondRequest(BaseModel):
     total_supply: float
     interest_rate: float
     maturity_date: datetime.date
-    payment_schedule: str
+    payment_schedule: List[PaymentScheduleItem]
     is_callable: bool = False
     is_convertible: bool = False
     penalty_rate: float = 0
@@ -251,10 +253,67 @@ class AddFundsRequest(BaseModel):
     token: str
     amount: float
 
+class AuctionDuration(BaseModel):
+    days: int
+    hours: int
+
+class AdjustmentDetails(BaseModel):
+    intervalDays: int
+    intervalHours: int
+    amount: float
+    rate: float
+
+class BondDuration(BaseModel):
+    years: int
+    months: int
+    days: int
+
+class FixedPaymentInterval(BaseModel):
+    days: int
+    months: int
+    years: int
+
+class AuctionSchedule(BaseModel):
+    auctionType: str
+    auctionDuration: AuctionDuration
+    auctionEndCondition: str
+    adjustAutomatically: bool
+    adjustmentDetails: AdjustmentDetails
+    bondDuration: BondDuration
+    repaymentType: str
+    paymentSchedule: str
+    fixedPaymentInterval: FixedPaymentInterval
+    startAutomatically: bool
+    startDate: str
+    timezone: str
+
+class BondDetails(BaseModel):
+    title: str
+    totalAmount: str
+    infiniteTokens: bool
+    tokens: str
+    tokenPrice: str
+    interestRate: str
+    maxInterestRate: str
+    minPrice: str
+    requiresFullSale: bool
+    latePenalty: str
+    earlyRepayment: bool
+    collateral: bool
+
+class SaveDraftRequest(BaseModel):
+    draft_id: Optional[int] = None
+    project_info: Dict[str, str]
+    bond_details: BondDetails
+    auction_schedule: AuctionSchedule
+    payment_schedule: List[PaymentScheduleItem]
+
 class UserDetail(User):
     bonds_created: List[Bond] = []
     bonds_purchased: List[Bond] = []
     tokens_held: List[Token] = []
+    draft_bonds: List[Dict] = []
+
 
 # API Endpoints
 @app.post("/users", response_model=User)
@@ -276,7 +335,7 @@ def add_funds(request: AddFundsRequest):
     
     token_id = None
     for id, token in tokens.items():
-        if token["symbol"] == request.token:
+        if token.symbol == request.token:
             token_id = id
             break
 
@@ -288,10 +347,12 @@ def add_funds(request: AddFundsRequest):
 
     users[request.user_id]["balances"][request.token] += request.amount
 
-    if request.user_id not in tokens[token_id]["balances"]:
-        tokens[token_id]["balances"][request.user_id] = 0
+    token = tokens[token_id]
 
-    tokens[token_id]["balances"][request.user_id] += request.amount
+    if request.user_id not in token.balances:
+        token.balances[request.user_id] = 0
+
+    token.balances[request.user_id] += request.amount
 
     return {"message": "Funds added successfully", "new_balance": users[request.user_id]["balances"][request.token]}
 
@@ -299,14 +360,28 @@ def add_funds(request: AddFundsRequest):
 def get_user(user_id: int):
     if user_id not in users:
         raise HTTPException(status_code=404, detail="User not found")
+    
     user = users[user_id]
+    
+    # Retrieve bonds created by the user
     user_bonds = [bond for bond in bonds.values() if bond["issuer"] == user_id]
     user["bonds_created"] = user_bonds
+    
+    # Retrieve bonds purchased by the user
     user_bonds_purchased = [bond for bond in bonds.values() if user_id in bond["balances"] and bond["balances"][user_id] > 0]
     user["bonds_purchased"] = user_bonds_purchased
-    user_tokens = [token for token in tokens.values() if user_id in token["balances"] and token["balances"][user_id] > 0]
+    
+    # Retrieve tokens held by the user
+    user_tokens = [token for token in tokens.values() if user_id in token.balances and token.balances[user_id] > 0]
     user["tokens_held"] = user_tokens
+    
+    # Retrieve draft bonds created by the user
+    user_drafts = [draft for draft in projects.values() if draft["user_id"] == user_id and draft["is_draft"]]
+    user["draft_bonds"] = user_drafts
+    
     return user
+
+
 
 @app.get("/current_user", response_model=User)
 def get_current_user():
@@ -326,12 +401,14 @@ def switch_user(user_id: int):
 @app.post("/tokens", response_model=Token)
 def create_token(token: CreateTokenRequest):
     token_id = len(tokens) + 1
-    tokens[token_id] = {
+    tokens[token_id] = ERC20Token(token_id, token.name, token.symbol, token.total_supply)
+    tokens[token_id].balances[token_id] = token.total_supply
+    return {
         "id": token_id,
         "name": token.name,
         "symbol": token.symbol,
         "total_supply": token.total_supply,
-        "balances": {}
+        "balances": tokens[token_id].balances
     }
     return tokens[token_id]
 
@@ -357,6 +434,50 @@ def issue_bond(user_id: int, bond_request: IssueBondRequest):
     })
     bonds[bond_id] = bond
     return bond
+
+@app.post("/users/{user_id}/save_draft", response_model=Dict)
+def save_draft(user_id: int, draft_request: SaveDraftRequest):
+    if user_id not in users:
+        raise HTTPException(status_code=404, detail="User not found")
+    
+    draft_id = draft_request.draft_id
+    if draft_id and draft_id in projects and projects[draft_id]["user_id"] == user_id:
+        # Update existing draft
+        projects[draft_id].update({
+            "project_info": draft_request.project_info,
+            "bond_details": draft_request.bond_details,
+            "auction_schedule": draft_request.auction_schedule,
+            "payment_schedule": draft_request.payment_schedule,
+            "is_draft": True
+        })
+        message = "Draft updated successfully"
+    else:
+        # Create new draft
+        draft_id = len(projects) + 1
+        projects[draft_id] = {
+            "user_id": user_id,
+            "draft_id": draft_id,
+            "project_info": draft_request.project_info,
+            "bond_details": draft_request.bond_details,
+            "auction_schedule": draft_request.auction_schedule,
+            "payment_schedule": draft_request.payment_schedule,
+            "is_draft": True
+        }
+        message = "Draft saved successfully"
+
+    return {"message": message, "draft_id": draft_id}
+
+@app.delete("/users/{user_id}/delete_draft/{draft_id}", response_model=Dict)
+def delete_draft(user_id: int, draft_id: int):
+    if user_id not in users:
+        raise HTTPException(status_code=404, detail="User not found")
+    if draft_id not in projects or projects[draft_id]["user_id"] != user_id:
+        raise HTTPException(status_code=404, detail="Draft not found or does not belong to the user")
+
+    del projects[draft_id]
+    return {"message": "Draft deleted successfully"}
+
+
 
 @app.post("/users/{user_id}/start_auction/{bond_id}")
 def start_auction(user_id: int, bond_id: int, initial_price: float, duration: int):
@@ -400,15 +521,21 @@ def bid_auction(user_id: int, bond_id: int, bid_amount: float):
         raise HTTPException(status_code=400, detail="Auction has ended")
     if bid_amount < bond["auction_price"]:
         raise HTTPException(status_code=400, detail="Bid amount is less than current auction price")
-    # Ensure the user has enough balance (for simplicity, assume the balance is in the form of the token used for the bond)
-    if user_id not in tokens:
-        raise HTTPException(status_code=400, detail="User does not have enough balance")
-    if tokens[user_id]["balances"].get(user_id, 0) < bid_amount:
+    
+    token_id = None
+    for id, token in tokens.items():
+        if user_id in token.balances and token.balances[user_id] >= bid_amount:
+            token_id = id
+            break
+
+    if token_id is None:
         raise HTTPException(status_code=400, detail="Insufficient balance")
-    # Transfer the bid amount from the bidder to the bond issuer
-    if not tokens[user_id].transfer(user_id, bond["issuer"], bid_amount):
+
+    token = tokens[token_id]
+
+    if not token.transfer(user_id, bond["issuer"], bid_amount):
         raise HTTPException(status_code=400, detail="Transfer failed")
-    # Transfer the bond to the bidder
+    
     bond_contract = BondContract(**bond)
     bond_contract.transfer(bond["issuer"], user_id, bid_amount)
     bond["auction_price"] = bid_amount
@@ -478,5 +605,16 @@ def simulate_time_passage(user_id: int, bond_id: int, days: int):
     bond_contract = BondContract(**bond)
     bond_contract.simulate_time_passage(days)
     return {"message": "Time passage simulated successfully"}
+
+@app.get("/users/{user_id}/bonds", response_model=List[Bond])
+def get_user_bonds(user_id: int):
+    if user_id not in users:
+        raise HTTPException(status_code=404, detail="User not found")
+    user_bonds = [bond for bond in bonds.values() if bond["issuer"] == user_id]
+    return user_bonds
+
+@app.get("/bonds", response_model=List[Bond])
+def get_bonds():
+    return list(bonds.values())
 
 # Run the server using the command: uvicorn main:app --reload
