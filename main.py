@@ -516,40 +516,58 @@ class FixedPaymentInterval(BaseModel):
     months: int
     years: int
 
+class CustomRepaymentInterval(BaseModel):
+    days: int
+    months: int
+    years: int
+    principalPercent: float
+    interestPercent: float
+
+class ProjectInfo(BaseModel):
+    name: str
+    description: str
+    website: str
+    imageUrl: str
+    coinGeckoUrl: str
+
 class AuctionSchedule(BaseModel):
     auctionType: str
     auctionDuration: AuctionDuration
     auctionEndCondition: str
     adjustAutomatically: bool
+    adjustmentType: str
     adjustmentDetails: AdjustmentDetails
-    bondDuration: BondDuration
-    repaymentType: str
-    paymentSchedule: str
-    fixedPaymentInterval: FixedPaymentInterval
+    minPrice: float
     startAutomatically: bool
     startDate: str
     timezone: str
 
 class BondDetails(BaseModel):
     title: str
-    totalAmount: str
+    totalAmount: int
     infiniteTokens: bool
-    tokens: str
-    tokenPrice: str
-    interestRate: str
-    maxInterestRate: str
-    minPrice: str
+    tokens: int
+    tokenPrice: float
+    tokenSymbol: str
+    interestRate: float
     requiresFullSale: bool
-    latePenalty: str
+    latePenalty: float
     earlyRepayment: bool
     collateral: bool
 
+class BondRepayment(BaseModel):
+    bondDuration: BondDuration
+    repaymentType: str
+    paymentSchedule: str
+    fixedPaymentInterval: FixedPaymentInterval
+    customRepaymentSchedule: List[CustomRepaymentInterval]
+
 class SaveDraftRequest(BaseModel):
     draft_id: Optional[str] = None
-    project_info: Dict[str, str]
+    project_info: ProjectInfo
     bond_details: BondDetails
     auction_schedule: AuctionSchedule
-    payment_schedule: List[PaymentScheduleItem]
+    bond_repayment: BondRepayment
 
 class UserDetail(User):
     bonds_created: List[Bond] = []
@@ -767,7 +785,7 @@ def save_draft(user_id: str, draft_request: SaveDraftRequest):
             "project_info": draft_request.project_info,
             "bond_details": draft_request.bond_details,
             "auction_schedule": draft_request.auction_schedule,
-            "payment_schedule": draft_request.payment_schedule,
+            "bond_repayment": draft_request.bond_repayment,
             "is_draft": True
         })
         message = "Draft updated successfully"
@@ -780,7 +798,7 @@ def save_draft(user_id: str, draft_request: SaveDraftRequest):
             "project_info": draft_request.project_info,
             "bond_details": draft_request.bond_details,
             "auction_schedule": draft_request.auction_schedule,
-            "payment_schedule": draft_request.payment_schedule,
+            "bond_repayment": draft_request.bond_repayment,
             "is_draft": True
         }
         message = "Draft saved successfully"
