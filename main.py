@@ -7,7 +7,7 @@ from pydantic import BaseModel
 from typing import Dict, List, Optional
 import datetime
 import secrets
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
 from enum import Enum
 
 app = FastAPI()
@@ -345,12 +345,12 @@ class BondContract(ERC20Snapshot):
             return 0
         payment_due_block = snapshot_block + 5760 * 7 
         penalty_amount_remaining = 0
-        if curr_block > payment_due_block and self.bond_details.latePenalty > 0:
+        if curr_block > payment_due_block and self.bond_repayment.latePenalty > 0:
             # The issuer has 7 days to allocate funds to the snapshot
             # If they don't allocate funds within this time, the penalty is applied
             penalty_amount = self._get_apr_amount_for_block_window(
                 total_amount= amount_due,
-                interest_rate=self.bond_details.latePenalty,
+                interest_rate=self.bond_repayment.latePenalty,
                 start_block=payment_due_block,
                 end_block=curr_block
             )
@@ -713,9 +713,6 @@ class PaymentScheduleItem(BaseModel):
     years: int
     amount: float
 
-class Bond(BaseModel):
-    bond_id: str
-
 class IssueBondRequest(BaseModel):
     user_id: str
     draft_id: str
@@ -809,7 +806,6 @@ class BondDetails(BaseModel):
     tokenSymbol: str
     interestRate: float
     requiresFullSale: bool
-    latePenalty: float
     earlyRepayment: bool
     collateral: bool
     paymentTokenAddress: Optional[str] = frax_token_id
@@ -818,8 +814,27 @@ class BondRepayment(BaseModel):
     bondDuration: BondDuration
     repaymentType: str
     paymentSchedule: str
+    latePenalty: float
     fixedPaymentInterval: FixedPaymentInterval
     customRepaymentSchedule: List[CustomRepaymentInterval]
+
+class Bond(BaseModel):
+    bond_id: str
+
+class PublishedBondPreview(BaseModel):
+    contract_address: str
+    name : str
+    status: str
+    apr: float
+    interest: float
+    duration: BondDuration
+    token_price: float
+    tokens: int
+    total_amount: int
+    total_supply: int
+    auction_start_block: int
+    auction_end_block: int
+    next_snap_shot_block: int
 
 class SaveDraftRequest(BaseModel):
     draft_id: Optional[str] = None
@@ -829,8 +844,8 @@ class SaveDraftRequest(BaseModel):
     bond_repayment: BondRepayment
 
 class UserDetail(User):
-    bonds_created: List[Bond] = []
-    bonds_purchased: List[Bond] = []
+    bonds_created: List[PublishedBondPreview] = []
+    bonds_purchased: List[PublishedBondPreview] = []
     tokens_held: List[Token] = []
     draft_bonds: List[Dict] = []
 
@@ -922,7 +937,6 @@ class BondDetailsStruct:
     tokenSymbol: str
     interestRate: int
     requiresFullSale: bool
-    latePenalty: int
     earlyRepayment: bool
     collateral: bool
     paymentTokenAddress: str
@@ -933,6 +947,7 @@ class BondRepaymentStruct:
     bondTotalDurationBlocks: int
     repaymentType: str
     paymentSchedule: str
+    latePenalty: int
     fixedPaymentInterval: FixedPaymentIntervalStruct
     customRepaymentSchedule: List[CustomRepaymentIntervalStruct]
 
@@ -1025,9 +1040,10 @@ def get_user(user_id: str):
     user = users[user_id]
     
     # Retrieve bonds created by the user
-    # user_bonds = [launcher_contract.bonds[bond_id] for bond_id in launcher_contract.issuer_bonds.get(user_id, [])]
+    user_bonds = [launcher_contract.bonds[bond_id] for bond_id in launcher_contract.issuer_bonds.get(user_id, [])]
+    user_created_bond_previews = [build_bond_preview_from_bond(bond) for bond in user_bonds]
     # user["bonds_created"] = user_bonds
-    user["bonds_created"] = [{'bond_id': id} for id in launcher_contract.issuer_bonds.get(user_id, [])]
+    user["bonds_created"] = user_created_bond_previews
     
     # Retrieve bonds purchased by the user
     user_bonds_purchased = [bond for bond in bonds.values() if user_id in bond["balances"] and bond["balances"][user_id] > 0]
@@ -1079,7 +1095,7 @@ def get_tokens():
     return list(tokens.values())
 
 @app.post("/users/{user_id}/issue_bond", response_model=Bond)
-def issue_bond(user_id: str, request: IssueBondRequest):
+def issue_bond(user_id: str, request: SaveDraftRequest):
     if user_id not in users:
         raise HTTPException(status_code=404, detail="User not found")
     if launcher_contract.bond_issuance_stopped:
@@ -1090,9 +1106,12 @@ def issue_bond(user_id: str, request: IssueBondRequest):
     # TODO: need an auction end data and convert to block number
     # TODO: timezone is not used in the contract
     # TODO: we need bondTotalDuration in bond repayment in blocks
+    draft_response = save_draft(user_id, request)
+    draft_id = draft_response["draft_id"]
+
 
     # Retrieve the draft bond data
-    draft_data = projects.get(request.draft_id)
+    draft_data = projects.get(draft_id)
     if not draft_data or draft_data["user_id"] != user_id:
         raise HTTPException(status_code=404, detail="Draft not found or user mismatch")
 
@@ -1122,6 +1141,58 @@ def issue_bond(user_id: str, request: IssueBondRequest):
     # TODO: delete the draft
 
     return {"bond_id": bond_id}
+
+def calculate_apr(future_value, present_value, days=0, months=0, years=0):
+    # Convert the total duration into years
+    duration_years = years + (months / 12) + (days / 365)
+    
+    # Calculate APR
+    apr = ((future_value / present_value) ** (1 / duration_years) - 1) * 100
+    return apr
+
+def convert_bond_status_to_string(status):
+    if status == BondState.AUCTION_NOT_STARTED:
+        return "Pre-Auction"
+    if status == BondState.AUCTION_LIVE:
+        return "Auction Live"
+    if status == BondState.BOND_LIVE:
+        return "Bond Live"
+    if status == BondState.BOND_ENDED:
+        return "Bond Ended"
+    if status == BondState.BOND_CANCELLED:
+        return "Bond Cancelled"
+    if status == BondState.ACTIVITY_HALTED:
+        return "Activity Halted"
+
+def build_bond_preview_from_bond(bond):
+    status = bond.get_bond_status()
+    apr = bond.bond_details.interestRate
+    if status == BondState.AUCTION_LIVE:
+        auction_price = bond.get_current_auction_price()
+        token_price = bond.bond_details.tokenPrice
+        days = bond.repayment_duration.bondDuration.days
+        months = bond.repayment_duration.bondDuration.months
+        years = bond.repayment_duration.bondDuration.years
+        apr = calculate_apr(token_price, auction_price, days, months, years)
+        apr += bond.bond_details.interestRate
+
+        
+    
+    return PublishedBondPreview(
+        contract_address=bond.contract_address,
+        name=bond.bond_details.title,
+        status=convert_bond_status_to_string(status),
+        apr=apr,
+        interest=bond.bond_details.interestRate,
+        duration=asdict(bond.bond_repayment.bondDuration),
+        token_price=bond.bond_details.tokenPrice,
+        tokens=bond.bond_details.tokens,
+        total_amount=bond.bond_details.totalAmount,
+        total_supply=bond.total_supply,
+        auction_start_block=bond.auction_start_block,
+        auction_end_block=bond.auction_end_block,
+        next_snap_shot_block=bond.next_eligible_snapshot()
+    )
 
 @app.post("/multi_sig/halt_withdrawals/{bond_id}")
 def halt_withdrawals(bond_id: str, user_id: str):
