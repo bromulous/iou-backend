@@ -7,6 +7,8 @@ from pydantic import BaseModel
 from typing import Dict, List, Optional
 import datetime
 import secrets
+from dataclasses import dataclass
+from enum import Enum
 
 app = FastAPI()
 
@@ -26,6 +28,16 @@ app.add_middleware(
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+@app.middleware("http")
+async def log_requests(request: Request, call_next):
+    logger.info(f"Incoming request: {request.method} {request.url.path}")
+    logger.info(f"Request headers: {request.headers}")
+    logger.info(f"Request query params: {request.query_params}")
+    body = await request.body()
+    logger.info(f"Request body: {body}")
+    response = await call_next(request)
+    return response
+
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
     logger.error(f"Validation error: {exc.errors()}")
@@ -41,17 +53,29 @@ bonds = {}
 projects = {}
 current_user_id = None
 block_offset = 0
+frax_token_id = ""
 
 dummy_user = {"id": "0x0000000000000000000000000000000000000000", "name": "Sam", "balances": {}}
 users[dummy_user['id']] = dummy_user
 current_user_id = dummy_user['id']
 
+class BondState(Enum):
+    AUCTION_NOT_STARTED = 0
+    AUCTION_LIVE = 1
+    BOND_LIVE = 2
+    ACTIVITY_HALTED = 3
+    BOND_CANCELLED = 4
+    BOND_ENDED = 5
+
 class LauncherBondContract:
     def __init__(self):
         self.bonds = {}
+        self.issuer_bonds = {}
         self.multi_sig_owners = set()
         self.multi_sig_threshold = 2  # Example threshold
         self.pending_approvals = {}
+        self.bond_issuance_stopped = False
+
 
     def add_multi_sig_owner(self, owner):
         self.multi_sig_owners.add(owner)
@@ -59,26 +83,21 @@ class LauncherBondContract:
     def remove_multi_sig_owner(self, owner):
         self.multi_sig_owners.discard(owner)
 
-    def create_bond_contract(self, name, symbol, total_supply, issuer, interest_rate, maturity_date, payment_schedule, is_callable=False, is_convertible=False, penalty_rate=0, requires_full_sale=True, early_withdrawal=False, adjustment_details=None):
-        bond_id = generate_ethereum_address()
+    def create_bond_contract(self, issuer, project_info, bond_details, auction_schedule, bond_repayment):
         bond_contract = BondContract(
-            bond_id,
-            name,
-            symbol,
-            total_supply,
             issuer,
-            interest_rate,
-            maturity_date,
-            payment_schedule,
-            is_callable,
-            is_convertible,
-            penalty_rate,
-            requires_full_sale,
-            early_withdrawal,
-            adjustment_details
+            project_info,
+            bond_details,
+            auction_schedule,
+            bond_repayment
         )
-        self.bonds[bond_id] = bond_contract
-        return bond_id, bond_contract
+        self.bonds[bond_contract.contract_address] = bond_contract
+        issuer_bonds = self.issuer_bonds.get(issuer, [])
+        if issuer not in self.issuer_bonds:
+            self.issuer_bonds[issuer] = [bond_contract.contract_address]
+        else:
+            self.issuer_bonds[issuer].append(bond_contract.contract_address)
+        return bond_contract.contract_address, bond_contract
 
     def halt_withdrawals(self, bond_id, owner):
         if owner not in self.multi_sig_owners:
@@ -103,8 +122,8 @@ launcher_contract.add_multi_sig_owner(dummy_user['id'])
 
 # Classes for ERC20Token and Bond operations
 class ERC20Token:
-    def __init__(self, id, name, symbol, total_supply):
-        self.id = id
+    def __init__(self, name, symbol, total_supply):
+        self.contract_address = generate_ethereum_address()
         self.name = name
         self.symbol = symbol
         self.total_supply = total_supply
@@ -138,8 +157,8 @@ class ERC20Token:
         return False
 
 class ERC20Snapshot(ERC20Token):
-    def __init__(self, id, name, symbol, total_supply):
-        super().__init__(id, name, symbol, total_supply)
+    def __init__(self, name, symbol, total_supply):
+        super().__init__(name, symbol, total_supply)
         self.snapshots = []
         self.snapshot_balances = {}
 
@@ -155,41 +174,33 @@ class ERC20Snapshot(ERC20Token):
         return 0
 
 class BondContract(ERC20Snapshot):
-    def __init__(self, bond_id, name, symbol, total_supply, issuer, interest_rate, maturity_date, payment_schedule, payment_token, token_price, is_callable=False, is_convertible=False, penalty_rate=0, requires_full_sale=True, early_withdrawal=False, adjustment_details=None, min_price=0):
-        super().__init__(bond_id, name, symbol, total_supply)
-        self.bond_id = bond_id
+    def __init__(self, issuer, project_info, bond_details, auction_schedule, bond_repayment):
+        super().__init__(bond_details.title, bond_details.tokenSymbol, 0)
         self.issuer = issuer
-        self.interest_rate = interest_rate
-        self.maturity_date = maturity_date
-        self.payment_schedule = payment_schedule
-        self.payment_token = payment_token  # Token used for payment
-        self.token_price = token_price  # Price of the token
-        self.is_callable = is_callable
-        self.is_convertible = is_convertible
-        self.penalty_rate = penalty_rate
-        self.requires_full_sale = requires_full_sale
-        self.early_withdrawal = early_withdrawal
-        self.snapshots = []
+        self.project_info = project_info
+        self.bond_details = bond_details
+        self.auction_schedule = auction_schedule
+        self.bond_repayment = bond_repayment
+        self.activity_halted = False
+        
+        # Bond state variables
+        self.auction_start_block = auction_schedule.startBlock
+        self.auction_end_block = auction_schedule.endBlock
+        self.bond_end_block = 0
+        self.bond_manually_cancelled = False
+
         self.payments = []
-        self.balances[issuer] = total_supply  # Issuer holds all bonds initially
-        self.auction_price = total_supply  # Initialize auction price as total supply
-        self.start_block = None
-        self.end_block = None
-        self.erc20_token = None  # Token used for payment (e.g., FRAX)
-        self.bond_sold = False
-        self.auction_active = False
-        self.approved_payees = set([self.issuer])
-        self.reentrancy_guard = False
-        self.withdrawals_halted = False
-        self.auto_auction_enabled = False
-        self.adjustment_details = adjustment_details
-        self.min_price = min_price
-        self.last_adjustment_block = None
-        self.total_bonded = 0  # Initial total bonded amount
-        self.total_allocated = 0  # Total funds allocated for claims
-        self.total_claimed = 0  # Total funds physically claimed by users
-        self.snapshot_bounty = {}
-        self.last_fully_paid_index = -1  # Index of the last fully paid payment
+        self.payments_index : Dict[str: int] = {}
+
+        self.total_repaid = 0
+        self.last_fully_paid_index = -1
+
+        self.snapshot_bounty : Dict[int, str] = {}
+        self.overpayment = 0
+        self.withdrawn_funds = False
+        self.funds_from_bond_purchase = 0
+
+        self.approved_payees = {}
 
 
     def only_issuer(func):
@@ -209,189 +220,449 @@ class BondContract(ERC20Snapshot):
             return result
         return wrapper
     
-    def update_total_bonded(self, amount):
-        self.total_bonded += amount  # Update the total bonded amount whenever tokens are issued
+    def convert_date_to_blocks(self, hours=0, days = 0, months = 0, years = 0):
+        # Assume each day is 5760 blocks (15 seconds per block)
+        return (years * 365 * 5760) + (months * 30 * 5760) + (days * 5760) + (hours * 240)
+
+    def convert_blocks_to_date(self, blocks):
+        return DateStruct(hours=blocks // 240, days=blocks // 5760, months=blocks // (5760 * 30), years=blocks // (5760 * 365))
+    
+    def elapsed_blocks_since_last_snapshot(self):
+        if len(self.snapshots) == 0:
+            return 0
+        if len(self.snapshots) == 1:
+            return get_current_block() - self.snapshots[0]
+        return get_current_block() - self.snapshots[-1]
+                    
+    def _calculate_snapshot_payment_due(self, snapshot_block):
+        if snapshot_block not in self.snapshot_balances:
+            return 0
+        start_block = self.auction_end_block
+        if len(self.snapshots) > 1:
+            start_block = self.snapshots[-1]
+        end_snapshot = self.auction_end_block + self.bond_repayment.bondTotalDurationBlocks
+        snapshot_block = min(snapshot_block, end_snapshot)
+        if start_block >= snapshot_block:
+            return 0
+        total_amount = self.total_supply * self.bond_details.token_price
+        if self.bond_repayment.paymentSchedule == "fixed":
+            interest_due = self._get_apr_amount_for_block_window(
+                total_amount=total_amount,
+                interest_rate=self.bond_details.interest_rate,
+                start_block=start_block,
+                end_block=snapshot_block
+            )
+            principal_due = 0
+            if self.bond_repayment.repaymentType == "interest-only" and snapshot_block == end_snapshot:
+                # If it's an interest-only bond, the principal is due at the end
+                principal_due = total_amount
+            if self.bond_repayment.repaymentType == "principal-interest":
+                elapsed_blocks = snapshot_block - start_block
+                principal_per_block = total_amount // (self.bond_repayment.bondTotalDurationBlocks)
+                principal_due = elapsed_blocks * principal_per_block
+            return principal_due + interest_due
+        else:
+            raise NotImplementedError("Custom repayment schedules not yet supported.")
+    
+    def next_eligible_snapshot(self):
+        status = self.get_bond_status()
+        if status != BondState.BOND_LIVE:
+            return 0
         
-    def calculate_payment_due(self, snapshot_block):
-        # Calculate both principal and interest
-        total_payment_due = self.total_bonded * (1 + self.interest_rate / 100)
-        return total_payment_due, snapshot_block
+        last_snapshot_block = 0
+        if len(self.snapshots) == 0:
+            last_snapshot_block = self.auction_end_block
+        else:
+            last_snapshot_block = self.snapshots[-1]
+        bond_end_block =  self.bond_repayment.bondTotalDurationBlocks+self.auction_end_block
+        if self.bond_repayment.paymentSchedule == "fixed":
+            days = self.bond_repayment.fixedPaymentInterval.days
+            months = self.bond_repayment.fixedPaymentInterval.months
+            years = self.bond_repayment.fixedPaymentInterval.years
+            return min(last_snapshot_block + self.convert_date_to_blocks(days=days, months=months, years=years), bond_end_block)
+        else:
+            custom_repayment_index = len(self.snapshots)
+            if custom_repayment_index < len(self.bond_repayment.customRepaymentSchedule):
+                days = self.bond_repayment.customRepaymentSchedule[custom_repayment_index].days
+                months = self.bond_repayment.customRepaymentSchedule[custom_repayment_index].months
+                years = self.bond_repayment.customRepaymentSchedule[custom_repayment_index].years
+                return min(last_snapshot_block + self.convert_date_to_blocks(days=days, months=months, years=years), bond_end_block)
+            else:
+                return max(last_snapshot_block, bond_end_block)
 
     def create_snapshot(self, caller):
+        status = self.get_bond_status()
+        if status != BondState.BOND_LIVE:
+            raise RuntimeError("Bond is not live.")
+        next_snapshot_block = self.next_eligible_snapshot()
+        curr_block = get_current_block()
+        if curr_block <= next_snapshot_block:
+            raise RuntimeError("Not yet eligible for snapshot.")
         snapshot_block = self._snapshot()
-        payment_due, snapshot_block = self.calculate_payment_due(snapshot_block)
-
-        penalty = 0
-        if self.total_deposited < payment_due:
-            penalty = self.penalty_rate
-
-        self.payments.append({
-            "snapshot_block": snapshot_block,
-            "total_amount": payment_due,
-            "total_claimed": 0,
-            "balances": {},  # Will be populated on user withdrawal
-            "penalty": penalty,
-            "snapshot_caller": caller
-        })
+        payment_due = self._calculate_snapshot_payment_due(snapshot_block)
+        self._add_payment(
+            PaymentStruct(
+                snapshot_block=snapshot_block, 
+                total_amount=payment_due, 
+                total_allocated=0, 
+                total_claimed=0,
+                balances={}, 
+                penalty_paid=0,
+                snapshot_caller=caller
+            )
+        )
         self.snapshot_bounty[snapshot_block] = caller
         return snapshot_block
     
-    def get_owed_payments(self, holder):
-        owed_amounts = []
-
-        for payment in self.payments:
-            snapshot_block = payment["snapshot_block"]
-            if snapshot_block not in self.snapshots:
-                continue
-
-            snapshot = self.snapshots[snapshot_block]
-            if holder in snapshot:
-                holder_balance = snapshot[holder]
-                total_snapshot_balance = self.total_bonded  # Use tracked total bonded amount
-                allocated_amount = payment["total_allocated"]
-                holder_share = (holder_balance / total_snapshot_balance) * allocated_amount
-                owed_amounts.append({
-                    "snapshot_block": snapshot_block,
-                    "amount_owed": holder_share
-                })
-
-        return owed_amounts
+    def _add_payment(self, payment):
+        self.payments.append(payment)
+        self.payments_index[payment.snapshot_block] = len(self.payments) - 1
     
-    def deposit_payment(self, amount):
-        # Access the token instance using the token address
-        payment_token_instance = tokens[self.payment_token]
+    def _get_payment_for_block(self, snapshot_block):
+        if snapshot_block not in self.payments_index:
+            raise RuntimeError("Payment not found.")
+        return self.payments[self.payments_index[snapshot_block]]
+    
+    def _get_apr_per_block(self, total_amount, interest_rate):
+        apr_amount = (interest_rate * total_amount) // 100
+        return apr_amount // (5760 * 365)
+    
+    def _get_apr_amount_for_block_window(self, total_amount, interest_rate, start_block, end_block):
+        apr_per_block = self._get_apr_per_block(total_amount, interest_rate)
+        if start_block >= end_block:
+            raise ValueError("Start block must be less than end block.")
+        elapsed_blocks = end_block - start_block
+        return elapsed_blocks * apr_per_block
+    
+    def get_amount_owed_for_snapshot(self, snapshot_block):
+        if snapshot_block not in self.snapshot_balances:
+            return 0
+        curr_block = get_current_block()
 
+        payment_info = self._get_payment_for_block(snapshot_block)
+        amount_due = payment_info.total_amount - payment_info.total_allocated
+        if amount_due <= 0:
+            return 0
+        payment_due_block = snapshot_block + 5760 * 7 
+        penalty_amount_remaining = 0
+        if curr_block > payment_due_block and self.bond_details.latePenalty > 0:
+            # The issuer has 7 days to allocate funds to the snapshot
+            # If they don't allocate funds within this time, the penalty is applied
+            penalty_amount = self._get_apr_amount_for_block_window(
+                total_amount= amount_due,
+                interest_rate=self.bond_details.latePenalty,
+                start_block=payment_due_block,
+                end_block=curr_block
+            )
+            penalty_amount_remaining = penalty_amount - payment_info.penalty_paid
+        return (amount_due, penalty_amount_remaining)
+    
+    def get_total_owed(self):
+        total_principal_owed = 0
+        total_penalty_owed = 0
+        for i in range(self.last_fully_paid_index + 1, len(self.payments)):
+            payment = self.payments[i]
+            principal, penalty = self.get_amount_owed_for_snapshot(payment["snapshot_block"])
+            total_principal_owed += principal
+            total_penalty_owed += penalty
+        return (total_principal_owed, total_penalty_owed)
+    
+    def get_total_owed_breakdown(self):
+        total_owed = []
+        for i in range(self.last_fully_paid_index + 1, len(self.payments)):
+            payment = self.payments[i]
+            principal, penalty = self.get_amount_owed_for_snapshot(payment["snapshot_block"])
+            total_owed += [[payment["snapshot_block"], principal, penalty]]
+        return total_owed
+    
+    @reentrancy_protection
+    def deposit_payment(self, amount):
+        status = self.get_bond_status()
+        if status != BondState.BOND_LIVE:
+            raise RuntimeError("Bond is not live.")
+        
+        # Access the token instance using the token address
+        payment_token_instance = tokens[self.bond_details.paymentTokenAddress]
+        
         # Ensure the issuer has approved enough tokens for the contract to transfer
         if payment_token_instance.allowance(self.issuer, self.bond_id) < amount:
             raise RuntimeError("Insufficient token approval.")
         
         # Transfer the tokens from issuer to contract
+        # This might create an over payment situation
+        # The overpayment will be allocated to the next snapshot
+        # If the issuer realizes they have overpaid they can withdraw unallocated funds
         if not payment_token_instance.transferFrom(self.issuer, self.bond_id, amount):
             raise RuntimeError("Transfer failed.")
-
-        self.total_deposited += amount
-        self.allocate_payments()
-
-    def allocate_payments(self):
-        remaining_amount = self.total_deposited - self.total_allocated
-
-        # Start from the last fully paid index + 1
+        
+        self._allocate_payments(amount)
+        
+        
+    
+    def _allocate_payments(self, amount):
+        amount += self.overpayment
+        
+        repaid = 0
+        
         for i in range(self.last_fully_paid_index + 1, len(self.payments)):
             payment = self.payments[i]
-            if remaining_amount <= 0:
+            principal_due, penalty_due = self.get_amount_owed_for_snapshot(payment["snapshot_block"])
+            penalty_payment_amount = 0
+            principal_payment_amount = 0
+            finished_payment = False
+
+            if amount >= principal_due + penalty_due:
+                penalty_payment_amount = penalty_due
+                principal_payment_amount = principal_due
+                finished_payment = True
+            elif penalty_due >= amount:
+                penalty_payment_amount = amount
+            else:
+                penalty_payment_amount = penalty_due
+                principal_payment_amount = amount - penalty_due
+            
+            payment.total_allocated += principal_payment_amount
+            payment.penalty_paid += penalty_payment_amount
+            repaid += principal_payment_amount
+            if finished_payment:
+                self.last_fully_paid_index += 1
+                finished_payment = False
+            amount -= penalty_payment_amount + principal_payment_amount
+            if amount <= 0:
                 break
+        
+        if amount > 0:
+            # Overpayment
+            self.overpayment = amount
+            
+        self.total_repaid += repaid
+        if self.total_repaid >= self.total_supply * self.bond_details.tokenPrice:
+            self.bond_end_block = get_current_block()
+            
+                
+    @only_issuer
+    @reentrancy_protection
+    def withdraw_overpayment(self, issuer):
+        if self.overpayment > 0:
+            payment_token_instance = tokens[self.bond_details.paymentTokenAddress]
+            if not payment_token_instance.transfer(self.bond_id, issuer, self.overpayment):
+                raise RuntimeError("Transfer failed.")
+            self.overpayment = 0
 
-            amount_due_with_penalty = payment["total_amount"] + (payment["total_amount"] * payment["penalty"])
-            amount_due = min(amount_due_with_penalty, remaining_amount)
-            remaining_amount -= amount_due
-            payment["total_allocated"] = amount_due  # Track allocated funds for this snapshot
-            self.total_allocated += amount_due
+    def get_amount_user_entitled_to_for_snapshot(self, holder, snapshot_block):
+        balance_at_snapshot = self.balance_of_at(holder, snapshot_block)
+        if balance_at_snapshot == 0:
+            return 0
+        
+        payment_info = self._get_payment_for_block(snapshot_block)
+        principal_percentage_owed = (payment_info.total_allocated * balance_at_snapshot) // self.total_supply
+        penalty_percentage_owed = (payment_info.penalty_paid * balance_at_snapshot) // self.total_supply
+        amount_already_claimed = payment_info.balances.get(holder, 0)
+        available_to_claim = principal_percentage_owed + penalty_percentage_owed - amount_already_claimed
 
-            # Update last fully paid index if payment is fully allocated
-            if amount_due >= amount_due_with_penalty:
-                self.last_fully_paid_index = i
-
-        self.total_allocated = self.total_deposited - remaining_amount
-
-
-    def claim_payment(self, holder):
-        total_claimed = 0
-
-        for payment in self.payments:
+        return [principal_percentage_owed, penalty_percentage_owed, amount_already_claimed, available_to_claim]
+    
+    def get_amount_user_entitled_to(self, holder):
+        amounts = []
+        for i in range(len(self.payments)):
+            payment = self.payments[i]
             snapshot_block = payment["snapshot_block"]
-            if snapshot_block not in self.snapshots:
+            amounts += [[snapshot_block] + self.get_amount_user_entitled_to_for_snapshot(holder, snapshot_block)]
+
+    @reentrancy_protection
+    def claim_payment_for_snapshot(self, holder, snapshot_block):
+        balance_at_snapshot = self.balance_of_at(holder, snapshot_block)
+        if balance_at_snapshot == 0:
+            return 0
+        payment_info = self._get_payment_for_block(snapshot_block)
+        principal_percentage_owed = (payment_info.total_allocated * balance_at_snapshot) // self.total_supply
+        penalty_percentage_owed = (payment_info.penalty_paid * balance_at_snapshot) // self.total_supply
+        amount_already_claimed = payment_info.balances.get(holder, 0)
+        available_to_claim = principal_percentage_owed + penalty_percentage_owed - amount_already_claimed
+        if available_to_claim == 0:
+            return 0
+        # Transfer token to holder
+        payment_token_instance = tokens[self.bond_details.paymentTokenAddress]
+        if not payment_token_instance.transfer(self.bond_id, holder, available_to_claim):
+            raise RuntimeError("Transfer failed.")
+        payment_info.balances[holder] += available_to_claim
+        payment_info.total_claimed += available_to_claim
+    
+    @reentrancy_protection
+    def claim_payments(self, holder):
+        total_claimed = 0
+        for payment in self.payments:
+            balance_at_snapshot = self.balance_of_at(holder, payment["snapshot_block"])
+            if balance_at_snapshot == 0:
                 continue
-
-            snapshot = self.snapshots[snapshot_block]
-            if holder in snapshot:
-                holder_balance = snapshot[holder]
-                total_snapshot_balance = self.total_bonded  # Use tracked total bonded amount
-                allocated_amount = payment["total_allocated"]
-                holder_share = (holder_balance / total_snapshot_balance) * allocated_amount
-                if self.payment_token.balanceOf(self.bond_id) >= holder_share:
-                    self.payment_token.transfer(self.bond_id, holder, holder_share)
-                    total_claimed += holder_share
-                    payment["total_allocated"] -= holder_share  # Update allocated amount
-
-        self.total_claimed += total_claimed  # Update total claimed amount
-        return total_claimed
+            principal_percentage_owed = (payment.total_allocated * balance_at_snapshot) // self.total_supply
+            penalty_percentage_owed = (payment.penalty_paid * balance_at_snapshot) // self.total_supply
+            amount_already_claimed = payment.balances.get(holder, 0)
+            available_to_claim = principal_percentage_owed + penalty_percentage_owed - amount_already_claimed
+            if available_to_claim == 0:
+                continue
+            payment.balances[holder] += available_to_claim
+            payment.total_claimed += available_to_claim
+            total_claimed += available_to_claim
+        # Transfer token to holder
+        payment_token_instance = tokens[self.bond_details.paymentTokenAddress]
+        if not payment_token_instance.transfer(self.bond_id, holder, total_claimed):
+            raise RuntimeError("Transfer failed.")
 
 
     @only_issuer
     @reentrancy_protection
-    def start_auction(self, issuer, initial_price, start_block, duration, payment_token):
-        if not self.auction_active and self.start_block is None:
-            self.auction_price = initial_price
-            self.start_block = start_block
-            self.end_block = start_block + duration if duration > 0 else None
-            self.erc20_token = payment_token
-            self.auction_active = True
-            self.last_adjustment_block = start_block
+    def start_auction(self, issuer):
+        status = self.get_bond_status()
+        if status != BondState.AUCTION_NOT_STARTED:
+            raise RuntimeError("Auction has already started.")
+        self.auction_start_block = get_current_block()            
+        
+    def get_remaining_tokens(self):
+        if self.bond_details.infiniteTokens:
+            return 1
+        return self.bond_details.tokens - self.total_supply
+    
+    def is_bond_sold_out(self):
+        if self.bond_details.infiniteTokens:
+            return False
+        return self.total_supply >= self.bond_details.tokens
+
+    @only_issuer
+    def halt_activity(self, issuer, status):
+        if type(status) != bool:
+            raise TypeError("Status should be a boolean.")
+        self.activity_halted = status
+    
+    def _is_pre_auction(self):
+        # Only called internally
+        # If we don't have a start block then the auction is manual and hasn't started yet
+        curr_block = get_current_block()
+        return self.auction_start_block == 0 or curr_block < self.auction_start_block
+    
+    def _is_auction_live(self):
+        # Only called internally
+        # When bond is purchased we will check to see if all tokens are sold and then set an end block if they are
+        # If they have a manual end block then we will set that as the end block unless all tokens are sold before that
+        curr_block = get_current_block()
+        return self.auction_start_block != 0 and self.auction_start_block <= curr_block \
+            and self.auction_end_block != 0 and curr_block <= self.auction_end_block
+    
+    def _is_bond_live(self):
+        # Only called internally
+        # bond_end_block is set when the issuer repays the final repayment 
+        # or makes all payments and they want to end early
+        curr_block = get_current_block()
+        return self.auction_end_block != 0 and self.auction_end_block <= curr_block \
+            and self.bond_end_block == 0
+    
+    def _is_bond_finished(self):
+        # Only called internally
+        # If the bond has ended and all payments have been made
+        return self.bond_end_block != 0
+
+
+    def _is_bond_cancelled(self):
+        # Only called internally
+        # If bond auction has started and ended and not all tokens are sold but required to be
+        curr_block = get_current_block()
+        auction_over = self.auction_end_block != 0 and self.auction_end_block <= curr_block
+        return self.bond_manually_cancelled \
+            or (auction_over and self.bond_details.requiresFullSale and not self.is_bond_sold_out())
+
+    
+    def get_bond_status(self):
+        # states:
+        # 0 - auction not started
+        # 1 - auction started
+        # 2 - auction ended/bond is live
+        # 3 - activity halted
+        # 4 - bond cancelled
+        current_block = get_current_block()
+        passed_auction_start_block = False
+        if self.activity_halted:
+            return BondState.ACTIVITY_HALTED
+        if self._is_pre_auction():
+            return BondState.AUCTION_NOT_STARTED
+        if self._is_auction_live():
+            return BondState.AUCTION_LIVE
+        if self._is_bond_live():
+            return BondState.BOND_LIVE
+        if self._is_bond_finished():    
+            return BondState.BOND_ENDED
+        if self._is_bond_cancelled():
+            return BondState.BOND_CANCELLED
+        
 
     @reentrancy_protection
     def purchase_bond(self, buyer, payment_token_amount, bond_token_amount):
-        self.apply_automatic_adjustment()
-        current_block = get_current_block()
-
-        if not self.auction_active or (self.start_block is not None and current_block < self.start_block):
+        auction_price = self.get_current_auction_price()
+        status = self.get_bond_status()
+        if status != BondState.AUCTION_LIVE:
             raise RuntimeError("Auction is not live.")
 
-        expected_bond_token_amount = payment_token_amount // self.auction_price
-        if bond_token_amount != expected_bond_token_amount:
+        expected_bond_token_amount = payment_token_amount // auction_price
+        if bond_token_amount < expected_bond_token_amount:
             raise ValueError("The number of bond tokens does not match the payment amount submitted at the current price.")
         
-        if self.balances[self.issuer] < bond_token_amount:
+        bond_tokens_to_transfer = min(bond_token_amount, expected_bond_token_amount)
+        
+        if not self.bond_details.infiniteTokens and self.bond_details.tokens - self.total_supply < bond_tokens_to_transfer:
             raise RuntimeError("Insufficient bond inventory.")
 
-        total_cost = bond_token_amount * self.auction_price
+        total_cost = bond_tokens_to_transfer * auction_price
         
-        if self.erc20_token.allowances.get(buyer, {}).get(self.bond_id, 0) < total_cost:
+        payment_token = tokens[self.bond_details.paymentTokenAddress]
+        if payment_token.allowances.get(buyer, {}).get(self.bond_id, 0) < total_cost:
             raise RuntimeError("Insufficient token approval.")
         
-        if not self.erc20_token.transferFrom(buyer, self.bond_id, total_cost):
+        if not payment_token.transferFrom(buyer, self.bond_id, total_cost):
             raise RuntimeError("Transfer failed.")
         
-        self.transfer(self.issuer, buyer, bond_token_amount)
-        
-        if self.balances[self.issuer] == 0:
-            self.bond_sold = True
+        self.total_supply += bond_tokens_to_transfer
+        self.balances[buyer] += bond_tokens_to_transfer
+        self.funds_from_bond_purchase += total_cost
+
+        if self.is_bond_sold_out():
+            self.auction_end_block = get_current_block()
 
 
     @only_issuer
     @reentrancy_protection
     def end_auction(self, issuer):
+        status = self.get_bond_status()
+        if status != BondState.AUCTION_LIVE:
+            raise RuntimeError("Auction is not live.")
         current_block = get_current_block()
-        if self.end_block is None or current_block >= self.end_block or (self.requires_full_sale and self.bond_sold):
-            self.auction_active = False
-            return True
-        return False
+        self.auction_end_block = current_block
 
     @only_issuer
     @reentrancy_protection
-    def withdraw_funds(self, issuer, amount):
-        if not self.requires_full_sale or self.bond_sold or self.early_withdrawal:
-            if self.erc20_token.balances[self.issuer] >= amount:
-                self.erc20_token.transfer(self.issuer, self.issuer, amount)
-                return True
-        return False
+    def withdraw_funds(self, issuer):
+        status = self.get_bond_status()
+        if status != BondState.BOND_LIVE:
+            raise RuntimeError("Bond is not live.")
+        if self.withdrawn_funds:
+            return False
+        funds_token = tokens[self.bond_details.paymentTokenAddress]
+        if not funds_token.transfer(self.contract_address, self.issuer, self.funds_from_bond_purchase):
+            raise RuntimeError("Transfer failed.")
+        self.withdrawn_funds = True
+        return True
 
+    @only_issuer
     def approve_payee(self, issuer, payee):
-        if self.issuer == issuer:
-            self.approved_payees.add(payee)
+        self.approved_payees[payee] = True
+    
+    @only_issuer
+    def remove_payee(self, issuer, payee):
+        self.approved_payees[payee] = False
 
     def convert_to_shares(self, holder, conversion_rate, shares_contract):
         if self.is_convertible:
             num_shares = self.balances[holder] * conversion_rate
             shares_contract.transfer(self.issuer, holder, num_shares)
             self.balances[holder] = 0
-
-    def call_bond(self, holder, call_price):
-        if self.is_callable:
-            self.transfer(holder, self.issuer, self.balances[holder])
-            self.erc20_token.transferFrom(self.issuer, holder, call_price)
-
-    def impose_penalty(self, holder, penalty_amount):
-        self.balances[holder] -= penalty_amount
 
     # Automatic auction functions
     @only_issuer
@@ -402,29 +673,26 @@ class BondContract(ERC20Snapshot):
     @only_issuer
     def disable_auto_auction(self, issuer):
         self.auto_auction_enabled = False
-
-    def apply_automatic_adjustment(self):
-        if self.auto_auction_enabled and self.adjustment_details:
-            current_block = get_current_block()
-            elapsed_blocks = current_block - self.last_adjustment_block
-            adjustment_interval_blocks = (self.adjustment_details["intervalDays"] * 5760) + (self.adjustment_details["intervalHours"] * 240)
-
-            while elapsed_blocks >= adjustment_interval_blocks:
-                self.auction_price = max(self.auction_price - self.adjustment_details["amount"], self.min_price)
-                self.last_adjustment_block += adjustment_interval_blocks
-                elapsed_blocks -= adjustment_interval_blocks
-
-    def get_current_price(self):
-        self.apply_automatic_adjustment()
-        return self.auction_price
     
-    @only_issuer
-    def set_min_price(self, issuer, min_price):
-        self.min_price = min_price
-
-    @only_issuer
-    def set_auction_price(self, issuer, new_price):
-        self.auction_price = new_price
+    def get_current_auction_price(self):
+        price = self.bond_details.tokenPrice
+        status = self.get_bond_status()
+        if status != BondState.AUCTION_LIVE:
+            return price
+        if self.auction_schedule.adjustAutomatically:
+            curr_block = get_current_block()
+            elapsed_blocks = curr_block - self.auction_start_block
+            adjustment_interval_blocks = self.convert_date_to_blocks(days=self.auction_schedule.adjustmentDetails.intervalDays, hours=self.auction_schedule.adjustmentDetails.intervalHours)
+            if adjustment_interval_blocks == 0:
+                return price
+            intervals_passed = elapsed_blocks // adjustment_interval_blocks # Make sure that we don't divide by 0 in the contract
+            price_interval_delta = 0
+            if self.auction_schedule.adjustmentType == "percentage":
+                price_interval_delta = price * self.auction_schedule.AdjustmentDetailsStruct.rate
+            elif self.auction_schedule.adjustmentType == "fixed":
+                price_interval_delta = self.auction_schedule.adjustmentDetails.amount
+            price = max(price - (price_interval_delta * intervals_passed), self.auction_schedule.minPrice)
+        return price
 
 # Pydantic models for API requests and responses
 class User(BaseModel):
@@ -433,7 +701,7 @@ class User(BaseModel):
     balances: Dict[str, float] = {}
 
 class Token(BaseModel):
-    id: str
+    contract_address: str
     name: str
     symbol: str
     total_supply: float
@@ -446,41 +714,11 @@ class PaymentScheduleItem(BaseModel):
     amount: float
 
 class Bond(BaseModel):
-    id: str
-    name: str
-    symbol: str
-    total_supply: float
-    issuer: str
-    interest_rate: float
-    maturity_date: datetime.date
-    payment_schedule: List[PaymentScheduleItem]
-    is_callable: bool
-    is_convertible: bool
-    penalty_rate: float
-    requires_full_sale: bool
-    early_withdrawal: bool
-    auction_price: float
-    auction_end_time: Optional[datetime.datetime]
-    bond_sold: bool
-    auction_active: bool
+    bond_id: str
 
 class IssueBondRequest(BaseModel):
-    name: str
-    symbol: str
-    total_supply: float
-    interest_rate: float
-    maturity_date: datetime.date
-    payment_schedule: List[PaymentScheduleItem]
-    is_callable: bool = False
-    is_convertible: bool = False
-    penalty_rate: float = 0
-    requires_full_sale: bool = True
-    early_withdrawal: bool = False
-    auction_initial_price: float
-    auction_duration: int
-    auto_auction_rate: Optional[float] = None
-    adjustment_details: Optional[Dict[str, int]] = None
-    min_price: float = 0
+    user_id: str
+    draft_id: str
 
 
 class CreateUserRequest(BaseModel):
@@ -540,7 +778,27 @@ class AuctionSchedule(BaseModel):
     minPrice: float
     startAutomatically: bool
     startDate: str
-    timezone: str
+
+
+    @property
+    def startBlock(self):
+        if self.startDate != "":
+            formats = ["%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"]
+            for fmt in formats:
+                try:
+                    return convert_to_blocks(datetime.datetime.strptime(self.startDate, fmt))
+                except ValueError:
+                    continue
+            raise ValueError(f"Date {self.startDate} does not match any known formats")
+        else:
+            return 0
+        
+    @property
+    def endBlock(self):
+        if self.startDate!= "" and self.auctionDuration.hours > 0 and self.auctionDuration.days > 0 and self.auctionEndCondition == "hard-end":
+            return convert_to_blocks(self.start_date) + convert_date_to_blocks(hours=self.auctionDuration.hours, days=self.auctionDuration.days)
+        else:
+            return 0
 
 class BondDetails(BaseModel):
     title: str
@@ -554,6 +812,7 @@ class BondDetails(BaseModel):
     latePenalty: float
     earlyRepayment: bool
     collateral: bool
+    paymentTokenAddress: Optional[str] = frax_token_id
 
 class BondRepayment(BaseModel):
     bondDuration: BondDuration
@@ -582,13 +841,120 @@ class PurchaseRequest(BaseModel):
     payment_token_amount: float
     bond_token_amount: float
 
+# Simulating Structs for passing data to the contract using dataclasses
+@dataclass
+class AuctionDurationStruct:
+    days: int
+    hours: int
+
+@dataclass
+class AdjustmentDetailsStruct:
+    intervalDays: int
+    intervalHours: int
+    amount: int
+    rate: int
+
+@dataclass
+class BondDurationStruct:
+    years: int
+    months: int
+    days: int
+
+@dataclass
+class FixedPaymentIntervalStruct:
+    days: int
+    months: int
+    years: int
+
+@dataclass
+class CustomRepaymentIntervalStruct:
+    days: int
+    months: int
+    years: int
+    principalPercent: int
+    interestPercent: int
+
+@dataclass
+class DateStruct:
+    hours: int
+    days: int
+    months: int
+    years: int
+
+@dataclass
+class PaymentStruct:
+    snapshot_block: int
+    total_amount: int
+    total_allocated: int
+    total_claimed: int
+    balances: Dict[str, int]
+    penalty_paid: int
+    snapshot_caller: str
+
+@dataclass
+class ProjectInfoStruct:
+    name: str
+    description: str
+    website: str
+    imageUrl: str
+    coinGeckoUrl: str
+
+@dataclass
+class AuctionScheduleStruct:
+    auctionType: str
+    auctionDuration: AuctionDurationStruct
+    auctionEndCondition: str
+    adjustAutomatically: bool
+    adjustmentType: str
+    adjustmentDetails: AdjustmentDetailsStruct
+    minPrice: int
+    startAutomatically: bool
+    startBlock: int
+    endBlock: int
+
+@dataclass
+class BondDetailsStruct:
+    title: str
+    totalAmount: int
+    infiniteTokens: bool
+    tokens: int
+    tokenPrice: int
+    tokenSymbol: str
+    interestRate: int
+    requiresFullSale: bool
+    latePenalty: int
+    earlyRepayment: bool
+    collateral: bool
+    paymentTokenAddress: str
+
+@dataclass
+class BondRepaymentStruct:
+    bondDuration: BondDurationStruct
+    bondTotalDurationBlocks: int
+    repaymentType: str
+    paymentSchedule: str
+    fixedPaymentInterval: FixedPaymentIntervalStruct
+    customRepaymentSchedule: List[CustomRepaymentIntervalStruct]
+
+@dataclass
+class SaveDraftRequestStruct:
+    project_info: ProjectInfoStruct
+    bond_details: BondDetailsStruct
+    auction_schedule: AuctionScheduleStruct
+    bond_repayment: BondRepaymentStruct
+    draft_id: Optional[str] = None
+
 # Helper Conversion Functions
 def convert_to_integer(amount: float, multiplier: int = 10000) -> int:
     return int(amount * multiplier)
 
-def convert_to_blocks(date: datetime.date) -> int:
+def convert_to_blocks(date: datetime) -> int:
     # Assume each day is 5760 blocks (15 seconds per block)
-    return (date - datetime.date(1970, 1, 1)).days * 5760
+    return (date.date() - datetime.date(1970, 1, 1)).days * 5760
+
+def convert_date_to_blocks(hours=0, days = 0, months = 0, years = 0):
+    # Assume each day is 5760 blocks (15 seconds per block)
+    return (years * 365 * 5760) + (months * 30 * 5760) + (days * 5760) + (hours * 240)
 
 def convert_payment_schedule(payment_schedule: List[PaymentScheduleItem]) -> List[Dict[str, int]]:
     return [
@@ -659,8 +1025,9 @@ def get_user(user_id: str):
     user = users[user_id]
     
     # Retrieve bonds created by the user
-    user_bonds = [bond for bond in bonds.values() if bond["issuer"] == user_id]
-    user["bonds_created"] = user_bonds
+    # user_bonds = [launcher_contract.bonds[bond_id] for bond_id in launcher_contract.issuer_bonds.get(user_id, [])]
+    # user["bonds_created"] = user_bonds
+    user["bonds_created"] = [{'bond_id': id} for id in launcher_contract.issuer_bonds.get(user_id, [])]
     
     # Retrieve bonds purchased by the user
     user_bonds_purchased = [bond for bond in bonds.values() if user_id in bond["balances"] and bond["balances"][user_id] > 0]
@@ -693,64 +1060,66 @@ def switch_user(user_id: str):
 
 @app.post("/tokens", response_model=Token)
 def create_token(token: CreateTokenRequest):
-    token_id = generate_ethereum_address()
-    tokens[token_id] = ERC20Token(token_id, token.name, token.symbol, token.total_supply)
-    tokens[token_id].balances[token_id] = token.total_supply
+    token = ERC20Token(token.name, token.symbol, token.total_supply)
+    tokens[token.contract_address] = token 
+    tokens[token.contract_address].balances[token.contract_address] = token.total_supply
     return {
-        "id": token_id,
+        "id": token.contract_address,
         "name": token.name,
         "symbol": token.symbol,
         "total_supply": token.total_supply,
-        "balances": tokens[token_id].balances
+        "balances": tokens[token.contract_address].balances
     }
+
+frax_token_info = CreateTokenRequest(name="Frax", symbol="FRAX", total_supply=100000000)
+frax_token_id = create_token(frax_token_info)['id']
 
 @app.get("/tokens", response_model=List[Token])
 def get_tokens():
     return list(tokens.values())
 
 @app.post("/users/{user_id}/issue_bond", response_model=Bond)
-def issue_bond(user_id: str, bond_request: IssueBondRequest):
+def issue_bond(user_id: str, request: IssueBondRequest):
     if user_id not in users:
         raise HTTPException(status_code=404, detail="User not found")
     if launcher_contract.bond_issuance_stopped:
         raise HTTPException(status_code=403, detail="Bond issuance has been halted")
+    
+    # TODO: auction startDate needs to be converted to block number and changed to startBlock
+    # TODO: Currently auction only ends based on whether it is sold out or manually ended
+    # TODO: need an auction end data and convert to block number
+    # TODO: timezone is not used in the contract
+    # TODO: we need bondTotalDuration in bond repayment in blocks
 
-    live_block = convert_to_blocks(bond_request.maturity_date) if bond_request.maturity_date else None
+    # Retrieve the draft bond data
+    draft_data = projects.get(request.draft_id)
+    if not draft_data or draft_data["user_id"] != user_id:
+        raise HTTPException(status_code=404, detail="Draft not found or user mismatch")
 
-    adjustment_details = {
-        "intervalDays": bond_request.adjustment_details["intervalDays"],
-        "intervalHours": bond_request.adjustment_details["intervalHours"],
-        "amount": convert_to_integer(bond_request.adjustment_details["amount"]),
-        "rate": convert_to_integer(bond_request.adjustment_details["rate"])
-    } if bond_request.adjustment_details else None
+    # Create data classes from the draft data
+    project_info = ProjectInfoStruct(**draft_data["project_info"].dict())
+    bond_details = BondDetailsStruct(**draft_data["bond_details"].dict())
+    auction_schedule = AuctionScheduleStruct(
+        auctionDuration=AuctionDurationStruct(**draft_data["auction_schedule"].dict()["auctionDuration"]),
+        startBlock=draft_data["auction_schedule"].startBlock,
+        endBlock= draft_data["auction_schedule"].endBlock,
+        **{k: v for k, v in draft_data["auction_schedule"].dict().items() if k not in ("auctionDuration", "startDate")}
+    )
+    bond_repayment = BondRepaymentStruct(
+        bondDuration=BondDurationStruct(**draft_data["bond_repayment"].dict()["bondDuration"]),
+        bondTotalDurationBlocks=convert_date_to_blocks(**draft_data["bond_repayment"].dict()["bondDuration"]),
+        fixedPaymentInterval=FixedPaymentIntervalStruct(**draft_data["bond_repayment"].dict()["fixedPaymentInterval"]),
+        customRepaymentSchedule=[
+            CustomRepaymentIntervalStruct(**item) for item in draft_data["bond_repayment"].dict()["customRepaymentSchedule"]
+        ],
+        **{k: v for k, v in draft_data["bond_repayment"].dict().items() if k not in ["bondDuration", "fixedPaymentInterval", "customRepaymentSchedule"]}
+    )
 
+    # Create the bond contract using the data classes
     bond_id, bond_contract = launcher_contract.create_bond_contract(
-        bond_request.name,
-        bond_request.symbol,
-        convert_to_integer(bond_request.total_supply),
-        user_id,  # The user is the issuer
-        convert_to_integer(bond_request.interest_rate),
-        live_block,
-        convert_payment_schedule(bond_request.payment_schedule),
-        bond_request.is_callable,
-        bond_request.is_convertible,
-        convert_to_integer(bond_request.penalty_rate),
-        bond_request.requires_full_sale,
-        bond_request.early_withdrawal,
-        adjustment_details,
-        convert_to_integer(bond_request.min_price)
+        user_id, project_info, bond_details, auction_schedule, bond_repayment
     )
-
-    bond_contract.start_auction(
-        user_id,
-        convert_to_integer(bond_request.auction_initial_price),
-        get_current_block(),
-        bond_request.auction_duration,
-        bond_contract.erc20_token
-    )
-
-    if bond_request.auto_auction_rate is not None:
-        bond_contract.enable_auto_auction(user_id, convert_to_integer(bond_request.auto_auction_rate))
+    # TODO: delete the draft
 
     return {"bond_id": bond_id}
 
@@ -778,6 +1147,7 @@ def stop_bond_issuance(user_id: str):
 def save_draft(user_id: str, draft_request: SaveDraftRequest):
     if user_id not in users:
         raise HTTPException(status_code=404, detail="User not found")
+    draft_request.bond_details.paymentTokenAddress = frax_token_id
     draft_id = draft_request.draft_id
     if draft_id and draft_id in projects and projects[draft_id]["user_id"] == user_id:
         # Update existing draft
