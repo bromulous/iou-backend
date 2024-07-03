@@ -835,6 +835,8 @@ class PublishedBondPreview(BaseModel):
     auction_start_block: int
     auction_end_block: int
     next_snap_shot_block: int
+    image_url: str
+    late_penalty: float
 
 class SaveDraftRequest(BaseModel):
     draft_id: Optional[str] = None
@@ -1191,7 +1193,9 @@ def build_bond_preview_from_bond(bond):
         total_supply=bond.total_supply,
         auction_start_block=bond.auction_start_block,
         auction_end_block=bond.auction_end_block,
-        next_snap_shot_block=bond.next_eligible_snapshot()
+        next_snap_shot_block=bond.next_eligible_snapshot(),
+        image_url=bond.project_info.imageUrl,
+        late_penalty=bond.bond_repayment.latePenalty
     )
 
 @app.post("/multi_sig/halt_withdrawals/{bond_id}")
