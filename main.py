@@ -593,6 +593,7 @@ class BondContract(ERC20Snapshot):
         if self._is_bond_cancelled():
             return BondState.BOND_CANCELLED
         
+        return BondState.AUCTION_NOT_STARTED
 
     @reentrancy_protection
     def purchase_bond(self, buyer, payment_token_amount, bond_token_amount):
@@ -809,6 +810,9 @@ class BondDetails(BaseModel):
     earlyRepayment: bool
     collateral: bool
     paymentTokenAddress: Optional[str] = frax_token_id
+
+    def __str__(self):
+        return f"title: {str(self.title)}, totalAmount: {str(self.totalAmount)}, infiniteTokens: {str(self.infiniteTokens)}, tokens: {str(self.tokens)}, tokenPrice: {str(self.tokenPrice)}, tokenSymbol: {str(self.tokenSymbol)}, interestRate: {str(self.interestRate)}, requiresFullSale: {str(self.requiresFullSale)}, earlyRepayment: {str(self.earlyRepayment)}, collateral: {str(self.collateral)}, paymentTokenAddress: {str(self.paymentTokenAddress)}"
 
 class BondRepayment(BaseModel):
     bondDuration: BondDuration
@@ -1046,7 +1050,6 @@ def get_user(user_id: str):
     user_created_bond_previews = [build_bond_preview_from_bond(bond) for bond in user_bonds]
     # user["bonds_created"] = user_bonds
     user["bonds_created"] = user_created_bond_previews
-    
     # Retrieve bonds purchased by the user
     user_bonds_purchased = [bond for bond in bonds.values() if user_id in bond["balances"] and bond["balances"][user_id] > 0]
     user["bonds_purchased"] = user_bonds_purchased
@@ -1178,8 +1181,6 @@ def build_bond_preview_from_bond(bond):
         apr = calculate_apr(token_price, auction_price, days, months, years)
         apr += bond.bond_details.interestRate
 
-        
-    
     return PublishedBondPreview(
         contract_address=bond.contract_address,
         name=bond.bond_details.title,
@@ -1361,9 +1362,12 @@ def get_user_bonds(user_id: str):
     user_bonds = [bond for bond in bonds.values() if bond["issuer"] == user_id]
     return user_bonds
 
-@app.get("/bonds", response_model=List[Bond])
+@app.get("/bonds", response_model=List[PublishedBondPreview])
 def get_bonds():
-    return list(bonds.values())
+    if len(launcher_contract.bonds) == 0:
+        return list()
+    bond_previews = [build_bond_preview_from_bond(bond) for bond in launcher_contract.bonds.values()]
+    return list(bond_previews)
 
 @app.get("/current_block", response_model=Dict)
 def get_current_block_info():
