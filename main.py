@@ -468,6 +468,7 @@ class BondContract(ERC20Snapshot):
             payment = self.payments[i]
             snapshot_block = payment["snapshot_block"]
             amounts += [[snapshot_block] + self.get_amount_user_entitled_to_for_snapshot(holder, snapshot_block)]
+        return amounts
 
     @reentrancy_protection
     def claim_payment_for_snapshot(self, holder, snapshot_block):
@@ -546,7 +547,7 @@ class BondContract(ERC20Snapshot):
         # If they have a manual end block then we will set that as the end block unless all tokens are sold before that
         curr_block = get_current_block()
         return self.auction_start_block != 0 and self.auction_start_block <= curr_block \
-            and self.auction_end_block != 0 and curr_block <= self.auction_end_block
+            and (self.auction_end_block == 0 or self.auction_end_block != 0 and curr_block <= self.auction_end_block)
     
     def _is_bond_live(self):
         # Only called internally
@@ -714,6 +715,9 @@ class PaymentScheduleItem(BaseModel):
     years: int
     amount: float
 
+class BondDetailsRequest(BaseModel):
+    user_id: str
+
 class IssueBondRequest(BaseModel):
     user_id: str
     draft_id: str
@@ -780,7 +784,7 @@ class AuctionSchedule(BaseModel):
 
     @property
     def startBlock(self):
-        if self.startDate != "":
+        if self.startAutomatically and self.startDate != "":
             formats = ["%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"]
             for fmt in formats:
                 try:
@@ -861,6 +865,64 @@ class SetPriceRequest(BaseModel):
 class PurchaseRequest(BaseModel):
     payment_token_amount: float
     bond_token_amount: float
+
+class PaymentRecord(BaseModel):
+    snapshot_block: int
+    total_amount: int
+    total_allocated: int
+    total_claimed: int
+    balances: Dict[str, int]
+    penalty_paid: int
+    snapshot_caller: str
+
+class AmountUserEntitledToRecord(BaseModel):
+    snapshot_block: int
+    principal_owed: float
+    penalty_owed: float
+    amount_already_claimed: float
+    available_to_claim: float
+
+class IssuerOwedBreakdown(BaseModel):
+    snapshot_block: int
+    principal_owed: int
+    penalty_owed: int
+
+class TotalIssuerOwes(BaseModel):
+    total_principal_owed: int
+    total_penalty_owed: int
+
+class PublishedBondDetails(BaseModel):
+    contract_address: str
+    issuer: str
+    total_supply: int
+    project_info: ProjectInfo
+    bond_details: BondDetails
+    auction_schedule: AuctionSchedule
+    bond_repayment: BondRepayment
+    activity_halted: bool
+
+    auction_start_block: int
+    auction_end_block: int
+    bond_end_block: int
+    bond_manually_cancelled: bool
+
+    payments: List[PaymentRecord]
+    overpayment: int
+
+    # Computed properties
+    next_eligible_snapshot: int
+    total_issuers_owes: TotalIssuerOwes
+    total_issuer_owes_break_down: List[IssuerOwedBreakdown]
+    amount_user_entitled_to_and_claimable : List[AmountUserEntitledToRecord] # This is only what they can currently claim
+    remaining_tokens : int
+    bond_sold_out : bool
+    bond_status: str
+    current_auction_price: float
+    apr : float
+
+
+
+
 
 # Simulating Structs for passing data to the contract using dataclasses
 @dataclass
@@ -976,6 +1038,10 @@ def convert_to_blocks(date: datetime) -> int:
 def convert_date_to_blocks(hours=0, days = 0, months = 0, years = 0):
     # Assume each day is 5760 blocks (15 seconds per block)
     return (years * 365 * 5760) + (months * 30 * 5760) + (days * 5760) + (hours * 240)
+
+def convert_blocks_to_date(block_number: int) -> datetime:
+    # Assume each day is 5760 blocks (15 seconds per block)
+    return datetime.datetime(1970, 1, 1) + datetime.timedelta(days=block_number // 5760)
 
 def convert_payment_schedule(payment_schedule: List[PaymentScheduleItem]) -> List[Dict[str, int]]:
     return [
@@ -1155,6 +1221,20 @@ def calculate_apr(future_value, present_value, days=0, months=0, years=0):
     apr = ((future_value / present_value) ** (1 / duration_years) - 1) * 100
     return apr
 
+def calculate_apr_from_bond(bond: BondContract):
+    status = bond.get_bond_status()
+    apr = bond.bond_details.interestRate
+    if status == BondState.AUCTION_LIVE:
+        auction_price = bond.get_current_auction_price()
+        token_price = bond.bond_details.tokenPrice
+        days = bond.bond_repayment.bondDuration.days
+        months = bond.bond_repayment.bondDuration.months
+        years = bond.bond_repayment.bondDuration.years
+        apr = calculate_apr(token_price, auction_price, days, months, years)
+        apr += bond.bond_details.interestRate
+    return apr
+
+
 def convert_bond_status_to_string(status):
     if status == BondState.AUCTION_NOT_STARTED:
         return "Pre-Auction"
@@ -1170,17 +1250,10 @@ def convert_bond_status_to_string(status):
         return "Activity Halted"
 
 def build_bond_preview_from_bond(bond):
-    status = bond.get_bond_status()
-    apr = bond.bond_details.interestRate
-    if status == BondState.AUCTION_LIVE:
-        auction_price = bond.get_current_auction_price()
-        token_price = bond.bond_details.tokenPrice
-        days = bond.repayment_duration.bondDuration.days
-        months = bond.repayment_duration.bondDuration.months
-        years = bond.repayment_duration.bondDuration.years
-        apr = calculate_apr(token_price, auction_price, days, months, years)
-        apr += bond.bond_details.interestRate
 
+    status = bond.get_bond_status()
+    apr = calculate_apr_from_bond(bond)
+    
     return PublishedBondPreview(
         contract_address=bond.contract_address,
         name=bond.bond_details.title,
@@ -1197,6 +1270,82 @@ def build_bond_preview_from_bond(bond):
         next_snap_shot_block=bond.next_eligible_snapshot(),
         image_url=bond.project_info.imageUrl,
         late_penalty=bond.bond_repayment.latePenalty
+    )
+
+def convert_project_dataclass_to_info_basemodel(dataclass_instance):
+    return ProjectInfo(**asdict(dataclass_instance))
+
+def convert_bond_dataclass_to_details_basemodel(dataclass_instance):
+    return BondDetails(**asdict(dataclass_instance))
+
+def convert_auction_dataclass_to_schedule_basemodel(dataclass_instance):
+    auction_schedule_dict = asdict(dataclass_instance)
+    auction_schedule_dict['auctionDuration'] = AuctionDuration(**auction_schedule_dict['auctionDuration'])
+    auction_schedule_dict['adjustmentDetails'] = AdjustmentDetails(**auction_schedule_dict['adjustmentDetails'])
+    
+    if auction_schedule_dict['startBlock'] != 0:
+        auction_schedule_dict['startDate'] = convert_blocks_to_date(auction_schedule_dict['startBlock']).isoformat()
+    else:
+        auction_schedule_dict['startDate'] = ""
+    
+    return AuctionSchedule(**auction_schedule_dict)
+
+def convert_bond_dataclass_to_repayment_basemodel(dataclass_instance):
+    bond_repayment_dict = asdict(dataclass_instance)
+    bond_repayment_dict['bondDuration'] = BondDuration(**bond_repayment_dict['bondDuration'])
+    bond_repayment_dict['fixedPaymentInterval'] = FixedPaymentInterval(**bond_repayment_dict['fixedPaymentInterval'])
+    bond_repayment_dict['customRepaymentSchedule'] = [
+        CustomRepaymentInterval(**item) for item in bond_repayment_dict['customRepaymentSchedule']
+    ]
+    return BondRepayment(**bond_repayment_dict)
+
+def build_bond_details_from_bond(bond: BondContract, user_id: str):
+    amount_entitled_to = bond.get_amount_user_entitled_to(user_id)
+    amount_user_entitled_to_and_claimable = []
+    for elem in amount_entitled_to:
+        record = AmountUserEntitledToRecord(
+            snapshot_block=elem[0],
+            principal_owed=elem[1],
+            penalty_owed=elem[2],
+            amount_already_claimed=elem[3],
+            available_to_claim=elem[4]
+        )
+        amount_user_entitled_to_and_claimable.append(record)
+
+    total_issuer_owes = bond.get_total_owed()
+    total_issuer_owes_break_down = []
+    for elem in bond.get_total_owed_breakdown():
+        record = IssuerOwedBreakdown(
+            snapshot_block=elem[0],
+            principal_owed=elem[1],
+            penalty_owed=elem[2]
+        )
+        total_issuer_owes_break_down.append(record)
+    
+    return PublishedBondDetails(
+        contract_address=bond.contract_address,
+        issuer=bond.issuer,
+        total_supply=bond.total_supply,
+        project_info=convert_project_dataclass_to_info_basemodel(bond.project_info),
+        bond_details=convert_bond_dataclass_to_details_basemodel(bond.bond_details),
+        auction_schedule=convert_auction_dataclass_to_schedule_basemodel(bond.auction_schedule),
+        bond_repayment=convert_bond_dataclass_to_repayment_basemodel(bond.bond_repayment),
+        activity_halted=bond.activity_halted,
+        auction_start_block=bond.auction_start_block,
+        auction_end_block=bond.auction_end_block,
+        bond_end_block=bond.bond_end_block,
+        bond_manually_cancelled=bond.bond_manually_cancelled,
+        payments=bond.payments,
+        overpayment=bond.overpayment,
+        next_eligible_snapshot=bond.next_eligible_snapshot(),
+        total_issuers_owes=TotalIssuerOwes(total_principal_owed=total_issuer_owes[0], total_penalty_owed=total_issuer_owes[1]),
+        total_issuer_owes_break_down=total_issuer_owes_break_down,
+        amount_user_entitled_to_and_claimable=amount_user_entitled_to_and_claimable,
+        remaining_tokens=bond.get_remaining_tokens(),
+        bond_sold_out=bond.is_bond_sold_out(),
+        bond_status=convert_bond_status_to_string(bond.get_bond_status()),
+        current_auction_price=bond.get_current_auction_price(),
+        apr=calculate_apr_from_bond(bond)
     )
 
 @app.post("/multi_sig/halt_withdrawals/{bond_id}")
@@ -1368,6 +1517,16 @@ def get_bonds():
         return list()
     bond_previews = [build_bond_preview_from_bond(bond) for bond in launcher_contract.bonds.values()]
     return list(bond_previews)
+
+@app.get("/bond/{bond_id}", response_model=PublishedBondDetails)
+def get_bond_details(bond_id: str, user_id:str):
+    if bond_id not in launcher_contract.bonds:
+        raise HTTPException(status_code=404, detail="Bond not found")
+    if user_id not in users:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    bond_contract = launcher_contract.bonds[bond_id]
+    return build_bond_details_from_bond(bond_contract, user_id)
 
 @app.get("/current_block", response_model=Dict)
 def get_current_block_info():
