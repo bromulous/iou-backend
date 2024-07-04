@@ -1,3 +1,4 @@
+from lib2to3.pytree import convert
 from fastapi.exceptions import RequestValidationError
 import logging
 from fastapi import FastAPI, HTTPException, Request
@@ -127,7 +128,7 @@ class ERC20Token:
         self.contract_address = generate_ethereum_address()
         self.name = name
         self.symbol = symbol
-        self.total_supply = total_supply
+        self.total_supply = total_supply *10**18
         self.balances = {}
         self.allowances = {}
 
@@ -148,6 +149,9 @@ class ERC20Token:
             self.allowances[owner][spender] = amount
             return True
         return False
+    
+    def allowanceOf(self, owner, spender):
+        return self.allowances.get(owner, {}).get(spender, 0)
 
     def transferFrom(self, spender, owner, receiver, amount):
         if self.allowances.get(owner, {}).get(spender, 0) >= amount and self.balances.get(owner, 0) >= amount:
@@ -710,6 +714,13 @@ class Token(BaseModel):
     total_supply: float
     balances: Dict[str, float] = {}
 
+class UserTokenDetails(BaseModel):
+    contract_address: str
+    name: str
+    symbol: str
+    total_supply: float
+    balance: float
+
 class PaymentScheduleItem(BaseModel):
     days: int
     months: int
@@ -802,6 +813,12 @@ class AuctionSchedule(BaseModel):
             return convert_to_blocks(self.start_date) + convert_date_to_blocks(hours=self.auctionDuration.hours, days=self.auctionDuration.days)
         else:
             return 0
+        
+    def dict(self, *args, **kwargs):
+        data = super().dict(*args, **kwargs)
+        data['startBlock'] = self.startBlock
+        data['endBlock'] = self.endBlock
+        return data
 
 class BondDetails(BaseModel):
     title: str
@@ -842,10 +859,13 @@ class PublishedBondPreview(BaseModel):
     total_amount: int
     total_supply: int
     auction_start_block: int
+    auction_start_date: str
     auction_end_block: int
+    auction_end_date: str
     next_snap_shot_block: int
     image_url: str
     late_penalty: float
+    bond_end_date: str
 
 class SaveDraftRequest(BaseModel):
     draft_id: Optional[str] = None
@@ -857,13 +877,16 @@ class SaveDraftRequest(BaseModel):
 class UserDetail(User):
     bonds_created: List[PublishedBondPreview] = []
     bonds_purchased: List[PublishedBondPreview] = []
-    tokens_held: List[Token] = []
+    tokens_held: List[UserTokenDetails] = []
     draft_bonds: List[Dict] = []
 
 class SetPriceRequest(BaseModel):
     price: float
 
 class PurchaseRequest(BaseModel):
+    user_id: str
+    bond_id: str
+    payment_token_address: str
     payment_token_amount: float
     bond_token_amount: float
 
@@ -885,12 +908,12 @@ class AmountUserEntitledToRecord(BaseModel):
 
 class IssuerOwedBreakdown(BaseModel):
     snapshot_block: int
-    principal_owed: int
-    penalty_owed: int
+    principal_owed: float
+    penalty_owed: float
 
 class TotalIssuerOwes(BaseModel):
-    total_principal_owed: int
-    total_penalty_owed: int
+    total_principal_owed: float
+    total_penalty_owed: float
 
 class PublishedBondDetails(BaseModel):
     contract_address: str
@@ -906,8 +929,9 @@ class PublishedBondDetails(BaseModel):
     auction_end_block: int
     bond_end_block: int
     bond_manually_cancelled: bool
+    bond_end_date: str
+    auction_end_date: str
 
-    payments: List[PaymentRecord]
     overpayment: int
 
     # Computed properties
@@ -915,7 +939,7 @@ class PublishedBondDetails(BaseModel):
     total_issuers_owes: TotalIssuerOwes
     total_issuer_owes_break_down: List[IssuerOwedBreakdown]
     amount_user_entitled_to_and_claimable : List[AmountUserEntitledToRecord] # This is only what they can currently claim
-    remaining_tokens : int
+    remaining_tokens : float
     bond_sold_out : bool
     bond_status: str
     current_auction_price: float
@@ -1028,9 +1052,27 @@ class SaveDraftRequestStruct:
     bond_repayment: BondRepaymentStruct
     draft_id: Optional[str] = None
 
+
+class ApproveRequest(BaseModel):
+    user_id: str
+    amount: float
+
+class SwapRequest(BaseModel):
+    sendTokenAddress: str
+    receiveTokenAddress: str
+    sendAmount: float
+    receiveAmount: float
+    user_id: str
+
+class SwapResponse(BaseModel):
+    balances: Dict[str, float]
+
 # Helper Conversion Functions
-def convert_to_integer(amount: float, multiplier: int = 10000) -> int:
+def convert_to_integer(amount: float, multiplier: int = 10**18) -> int:
     return int(amount * multiplier)
+
+def convert_to_float(amount: int, multiplier: int = 10**18) -> float:
+    return amount / multiplier
 
 def convert_to_blocks(date: datetime) -> int:
     # Assume each day is 5760 blocks (15 seconds per block)
@@ -1040,9 +1082,11 @@ def convert_date_to_blocks(hours=0, days = 0, months = 0, years = 0):
     # Assume each day is 5760 blocks (15 seconds per block)
     return (years * 365 * 5760) + (months * 30 * 5760) + (days * 5760) + (hours * 240)
 
-def convert_blocks_to_date(block_number: int) -> datetime:
+def convert_blocks_to_date_str(block_number: int) -> datetime:
     # Assume each day is 5760 blocks (15 seconds per block)
-    return datetime.datetime(1970, 1, 1) + datetime.timedelta(days=block_number // 5760)
+    if block_number == 0:
+        return ""
+    return (datetime.datetime(1970, 1, 1) + datetime.timedelta(days=block_number // 5760)).isoformat()
 
 def convert_payment_schedule(payment_schedule: List[PaymentScheduleItem]) -> List[Dict[str, int]]:
     return [
@@ -1090,20 +1134,12 @@ def add_funds(request: AddFundsRequest):
 
     if token_id is None:
         raise HTTPException(status_code=404, detail="Token not found")
+    token : ERC20Token = tokens[token_id]
+    if not token.transfer(token_id, request.user_id, convert_to_integer(request.amount)):
+        raise HTTPException(status_code=500, detail="Transfer failed")
+    
 
-    if request.token not in users[request.user_id]["balances"]:
-        users[request.user_id]["balances"][request.token] = 0
-
-    users[request.user_id]["balances"][request.token] += request.amount
-
-    token = tokens[token_id]
-
-    if request.user_id not in token.balances:
-        token.balances[request.user_id] = 0
-
-    token.balances[request.user_id] += request.amount
-
-    return {"message": "Funds added successfully", "new_balance": users[request.user_id]["balances"][request.token]}
+    return {"message": "Funds added successfully", "new_balance": convert_to_float(token.balanceOf(request.user_id))}
 
 @app.get("/users/{user_id}", response_model=UserDetail)
 def get_user(user_id: str):
@@ -1123,7 +1159,18 @@ def get_user(user_id: str):
     
     # Retrieve tokens held by the user
     user_tokens = [token for token in tokens.values() if user_id in token.balances and token.balances[user_id] > 0]
-    user["tokens_held"] = user_tokens
+    tokens_held = []
+    for token in user_tokens:
+        token: ERC20Token
+        rec = {
+            "contract_address": token.contract_address,
+            "name": token.name,
+            "symbol": token.symbol,
+            "balance": convert_to_float(token.balances[user_id]),
+            "total_supply": convert_to_float(token.total_supply)
+        }
+        tokens_held.append(rec)
+    user["tokens_held"] = tokens_held
     
     # Retrieve draft bonds created by the user
     user_drafts = [draft for draft in projects.values() if draft["user_id"] == user_id and draft["is_draft"]]
@@ -1188,28 +1235,16 @@ def issue_bond(user_id: str, request: SaveDraftRequest):
         raise HTTPException(status_code=404, detail="Draft not found or user mismatch")
 
     # Create data classes from the draft data
-    project_info = ProjectInfoStruct(**draft_data["project_info"].dict())
-    bond_details = BondDetailsStruct(**draft_data["bond_details"].dict())
-    auction_schedule = AuctionScheduleStruct(
-        auctionDuration=AuctionDurationStruct(**draft_data["auction_schedule"].dict()["auctionDuration"]),
-        startBlock=draft_data["auction_schedule"].startBlock,
-        endBlock= draft_data["auction_schedule"].endBlock,
-        **{k: v for k, v in draft_data["auction_schedule"].dict().items() if k not in ("auctionDuration", "startDate")}
-    )
-    bond_repayment = BondRepaymentStruct(
-        bondDuration=BondDurationStruct(**draft_data["bond_repayment"].dict()["bondDuration"]),
-        bondTotalDurationBlocks=convert_date_to_blocks(**draft_data["bond_repayment"].dict()["bondDuration"]),
-        fixedPaymentInterval=FixedPaymentIntervalStruct(**draft_data["bond_repayment"].dict()["fixedPaymentInterval"]),
-        customRepaymentSchedule=[
-            CustomRepaymentIntervalStruct(**item) for item in draft_data["bond_repayment"].dict()["customRepaymentSchedule"]
-        ],
-        **{k: v for k, v in draft_data["bond_repayment"].dict().items() if k not in ["bondDuration", "fixedPaymentInterval", "customRepaymentSchedule"]}
-    )
-
+    project_info = convert_project_info_to_struct(draft_data["project_info"])
+    bond_details = convert_bond_details_to_struct(draft_data["bond_details"])
+    auction_schedule = convert_auction_schedule_to_struct(draft_data["auction_schedule"])
+    bond_repayment = convert_bond_repayment_to_struct(draft_data["bond_repayment"])
+    
     # Create the bond contract using the data classes
     bond_id, bond_contract = launcher_contract.create_bond_contract(
         user_id, project_info, bond_details, auction_schedule, bond_repayment
     )
+    tokens[bond_contract.contract_address] = bond_contract
     # TODO: delete the draft
 
     return {"bond_id": bond_id}
@@ -1250,55 +1285,110 @@ def convert_bond_status_to_string(status):
     if status == BondState.ACTIVITY_HALTED:
         return "Activity Halted"
 
-def build_bond_preview_from_bond(bond):
+def build_bond_preview_from_bond(bond: BondContract):
 
     status = bond.get_bond_status()
-    apr = calculate_apr_from_bond(bond)
+    apr = convert_to_float(calculate_apr_from_bond(bond))
+    if bond.auction_end_block != 0:
+        bond_end_date = convert_blocks_to_date_str(bond.auction_end_block + bond.bond_repayment.bondTotalDurationBlocks)
+    else:
+        bond_end_date = ""
     
     return PublishedBondPreview(
         contract_address=bond.contract_address,
         name=bond.bond_details.title,
         status=convert_bond_status_to_string(status),
         apr=apr,
-        interest=bond.bond_details.interestRate,
-        duration=asdict(bond.bond_repayment.bondDuration),
-        token_price=bond.bond_details.tokenPrice,
-        tokens=bond.bond_details.tokens,
-        total_amount=bond.bond_details.totalAmount,
-        total_supply=bond.total_supply,
+        interest=convert_to_float(bond.bond_details.interestRate),
+        duration=BondDuration(**asdict(bond.bond_repayment.bondDuration)),
+        token_price=convert_to_float(bond.bond_details.tokenPrice),
+        tokens=convert_to_float(bond.bond_details.tokens),
+        total_amount=convert_to_float(bond.bond_details.totalAmount),
+        total_supply=convert_to_float(bond.total_supply),
         auction_start_block=bond.auction_start_block,
+        auction_start_date=convert_blocks_to_date_str(bond.auction_start_block),
         auction_end_block=bond.auction_end_block,
+        auction_end_date=convert_blocks_to_date_str(bond.auction_end_block),
         next_snap_shot_block=bond.next_eligible_snapshot(),
         image_url=bond.project_info.imageUrl,
-        late_penalty=bond.bond_repayment.latePenalty
+        late_penalty=convert_to_float(bond.bond_repayment.latePenalty),
+        bond_end_date=bond_end_date
     )
+
+
+def convert_project_info_to_struct(basemodel_instance):
+    return ProjectInfoStruct(**basemodel_instance.dict())
+
+def convert_bond_details_to_struct(basemodel_instance):
+    bond_details_dict = basemodel_instance.dict()
+    bond_details_dict['tokenPrice'] = convert_to_integer(bond_details_dict['tokenPrice'])
+    bond_details_dict['interestRate'] = convert_to_integer(bond_details_dict['interestRate'])
+    bond_details_dict['totalAmount'] = convert_to_integer(bond_details_dict['totalAmount'])
+    bond_details_dict['tokens'] = convert_to_integer(bond_details_dict['tokens'])
+    return BondDetailsStruct(**bond_details_dict)
+
+def convert_auction_schedule_to_struct(basemodel_instance):
+    auction_schedule_dict = basemodel_instance.dict()
+    auction_schedule_dict['auctionDuration'] = AuctionDurationStruct(**auction_schedule_dict['auctionDuration'])
+    auction_schedule_dict['adjustmentDetails'] = AdjustmentDetailsStruct(
+        **{k: (convert_to_integer(v) if k in ['amount', 'rate'] else v) for k, v in auction_schedule_dict['adjustmentDetails'].items()}
+    )
+    auction_schedule_dict['minPrice'] = convert_to_integer(auction_schedule_dict['minPrice'])
+    del auction_schedule_dict['startDate']
+    # auction_schedule_dict['startBlock'] = convert_to_blocks(auction_schedule_dict['startDate'])
+    return AuctionScheduleStruct(**auction_schedule_dict)
+
+def convert_bond_repayment_to_struct(basemodel_instance):
+    bond_repayment_dict = basemodel_instance.dict()
+    bond_repayment_dict['bondDuration'] = BondDurationStruct(**bond_repayment_dict['bondDuration'])
+    bond_repayment_dict['fixedPaymentInterval'] = FixedPaymentIntervalStruct(**bond_repayment_dict['fixedPaymentInterval'])
+    bond_repayment_dict['customRepaymentSchedule'] = [
+        CustomRepaymentIntervalStruct(
+            **{k: (convert_to_integer(v) if k in ['principalPercent', 'interestPercent'] else v) for k, v in item.items()}
+        ) for item in bond_repayment_dict['customRepaymentSchedule']
+    ]
+    bond_repayment_dict['latePenalty'] = convert_to_integer(bond_repayment_dict['latePenalty'])
+    bond_repayment_dict['bondTotalDurationBlocks'] = convert_date_to_blocks(**asdict(bond_repayment_dict['bondDuration']))
+    return BondRepaymentStruct(**bond_repayment_dict)
+
 
 def convert_project_dataclass_to_info_basemodel(dataclass_instance):
     return ProjectInfo(**asdict(dataclass_instance))
 
 def convert_bond_dataclass_to_details_basemodel(dataclass_instance):
-    return BondDetails(**asdict(dataclass_instance))
+    bond_details_dict = asdict(dataclass_instance)
+    bond_details_dict['tokenPrice'] = convert_to_float(bond_details_dict['tokenPrice'])
+    bond_details_dict['interestRate'] = convert_to_float(bond_details_dict['interestRate'])
+    bond_details_dict['totalAmount'] = convert_to_float(bond_details_dict['totalAmount'])
+    bond_details_dict['tokens'] = convert_to_float(bond_details_dict['tokens'])
+    return BondDetails(**bond_details_dict)
 
 def convert_auction_dataclass_to_schedule_basemodel(dataclass_instance):
     auction_schedule_dict = asdict(dataclass_instance)
     auction_schedule_dict['auctionDuration'] = AuctionDuration(**auction_schedule_dict['auctionDuration'])
-    auction_schedule_dict['adjustmentDetails'] = AdjustmentDetails(**auction_schedule_dict['adjustmentDetails'])
+    auction_schedule_dict['adjustmentDetails'] = AdjustmentDetails(
+        **{k: (convert_to_float(v) if k in ['amount', 'rate'] else v) for k, v in auction_schedule_dict['adjustmentDetails'].items()}
+    )
     
-    if auction_schedule_dict['startBlock'] != 0:
-        auction_schedule_dict['startDate'] = convert_blocks_to_date(auction_schedule_dict['startBlock']).isoformat()
-    else:
-        auction_schedule_dict['startDate'] = ""
+    auction_schedule_dict['startDate'] = convert_blocks_to_date_str(auction_schedule_dict['startBlock'])
+
+    auction_schedule_dict['minPrice'] = convert_to_float(auction_schedule_dict['minPrice'])
     
-    return AuctionSchedule(**auction_schedule_dict)
+    auction_schedule = AuctionSchedule(**auction_schedule_dict)
+    return auction_schedule
 
 def convert_bond_dataclass_to_repayment_basemodel(dataclass_instance):
     bond_repayment_dict = asdict(dataclass_instance)
     bond_repayment_dict['bondDuration'] = BondDuration(**bond_repayment_dict['bondDuration'])
     bond_repayment_dict['fixedPaymentInterval'] = FixedPaymentInterval(**bond_repayment_dict['fixedPaymentInterval'])
     bond_repayment_dict['customRepaymentSchedule'] = [
-        CustomRepaymentInterval(**item) for item in bond_repayment_dict['customRepaymentSchedule']
+        CustomRepaymentInterval(
+            **{k: (convert_to_float(v) if k in ['principalPercent', 'interestPercent'] else v) for k, v in item.items()}
+        ) for item in bond_repayment_dict['customRepaymentSchedule']
     ]
+    bond_repayment_dict['latePenalty'] = convert_to_float(bond_repayment_dict['latePenalty'])
     return BondRepayment(**bond_repayment_dict)
+
 
 def build_bond_details_from_bond(bond: BondContract, user_id: str):
     amount_entitled_to = bond.get_amount_user_entitled_to(user_id)
@@ -1306,10 +1396,10 @@ def build_bond_details_from_bond(bond: BondContract, user_id: str):
     for elem in amount_entitled_to:
         record = AmountUserEntitledToRecord(
             snapshot_block=elem[0],
-            principal_owed=elem[1],
-            penalty_owed=elem[2],
-            amount_already_claimed=elem[3],
-            available_to_claim=elem[4]
+            principal_owed=convert_to_float(elem[1]),
+            penalty_owed=convert_to_float(elem[2]),
+            amount_already_claimed=convert_to_float(elem[3]),
+            available_to_claim=convert_to_float(elem[4])
         )
         amount_user_entitled_to_and_claimable.append(record)
 
@@ -1318,15 +1408,22 @@ def build_bond_details_from_bond(bond: BondContract, user_id: str):
     for elem in bond.get_total_owed_breakdown():
         record = IssuerOwedBreakdown(
             snapshot_block=elem[0],
-            principal_owed=elem[1],
-            penalty_owed=elem[2]
+            principal_owed=convert_to_float(elem[1]),
+            penalty_owed=convert_to_float(elem[2])
         )
         total_issuer_owes_break_down.append(record)
-    
+
+    if bond.bond_end_block != 0:
+        bond_end_date = convert_blocks_to_date_str(bond.bond_end_block)
+    elif bond.auction_end_block != 0:
+        bond_end_date = convert_blocks_to_date_str(bond.auction_end_block + bond.bond_repayment.bondTotalDurationBlocks)
+    else:
+        bond_end_date = ""
+
     return PublishedBondDetails(
         contract_address=bond.contract_address,
         issuer=bond.issuer,
-        total_supply=bond.total_supply,
+        total_supply=convert_to_float(bond.total_supply),
         project_info=convert_project_dataclass_to_info_basemodel(bond.project_info),
         bond_details=convert_bond_dataclass_to_details_basemodel(bond.bond_details),
         auction_schedule=convert_auction_dataclass_to_schedule_basemodel(bond.auction_schedule),
@@ -1336,18 +1433,23 @@ def build_bond_details_from_bond(bond: BondContract, user_id: str):
         auction_end_block=bond.auction_end_block,
         bond_end_block=bond.bond_end_block,
         bond_manually_cancelled=bond.bond_manually_cancelled,
-        payments=bond.payments,
-        overpayment=bond.overpayment,
+        bond_end_date=bond_end_date,
+        auction_end_date=convert_blocks_to_date_str(bond.auction_end_block),
+        overpayment=convert_to_float(bond.overpayment),
         next_eligible_snapshot=bond.next_eligible_snapshot(),
-        total_issuers_owes=TotalIssuerOwes(total_principal_owed=total_issuer_owes[0], total_penalty_owed=total_issuer_owes[1]),
+        total_issuers_owes=TotalIssuerOwes(
+            total_principal_owed=convert_to_float(total_issuer_owes[0]), 
+            total_penalty_owed=convert_to_float(total_issuer_owes[1])
+        ),
         total_issuer_owes_break_down=total_issuer_owes_break_down,
         amount_user_entitled_to_and_claimable=amount_user_entitled_to_and_claimable,
-        remaining_tokens=bond.get_remaining_tokens(),
+        remaining_tokens=convert_to_float(bond.get_remaining_tokens()),
         bond_sold_out=bond.is_bond_sold_out(),
         bond_status=convert_bond_status_to_string(bond.get_bond_status()),
-        current_auction_price=bond.get_current_auction_price(),
-        apr=calculate_apr_from_bond(bond)
+        current_auction_price=convert_to_float(bond.get_current_auction_price()),
+        apr=convert_to_float(calculate_apr_from_bond(bond))
     )
+
 
 @app.post("/multi_sig/halt_withdrawals/{bond_id}")
 def halt_withdrawals(bond_id: str, user_id: str):
@@ -1425,7 +1527,7 @@ def start_auction(user_id: str, bond_id: str, initial_price: float, duration: in
     bond_contract.start_auction(user_id, convert_to_integer(initial_price), get_current_block(), duration, bond_contract.erc20_token)
     return {"message": "Auction started"}
 
-@app.post("/users/{user_id}/purchase_bond/{bond_id}")
+@app.post("/purchase_bond/{bond_id}")
 def purchase_bond(user_id: str, bond_id: str, request: PurchaseRequest):
     if user_id not in users:
         raise HTTPException(status_code=404, detail="User not found")
@@ -1621,5 +1723,57 @@ def get_owed_payments(bond_id: str, holder: str):
     owed_payments = bond_contract.get_owed_payments(holder)
 
     return {"owed_payments": owed_payments}
+
+@app.get("/balance/{tokenAddress}")
+def get_balance(tokenAddress: str, user_id: str):
+    if user_id not in users:
+        raise HTTPException(status_code=404, detail="User not found")
+    if tokenAddress not in tokens:
+        raise HTTPException(status_code=404, detail="Token not found")
+    token_contract = tokens[tokenAddress]
+    balance = convert_to_float(token_contract.balanceOf(user_id))
+    return {"balance": balance}
+
+@app.post("/approve/{tokenAddress}")
+def approve(tokenAddress: str, request: ApproveRequest):
+    if request.user_id not in users:
+        raise HTTPException(status_code=404, detail="User not found")
+    if tokenAddress not in tokens:
+        raise HTTPException(status_code=404, detail="Token not found")
+    user_id = request.user_id
+    amount = request.amount
+    token_contract = tokens[tokenAddress]
+    token_contract.approve(user_id, convert_to_integer(amount))
+    return {"message": "Approval set successfully"}
+
+@app.get("/approved/{tokenAddress}")
+def get_approved(tokenAddress: str, user_id: str, spender_id: str):
+    if user_id not in users:
+        raise HTTPException(status_code=404, detail="User not found")
+    if tokenAddress not in tokens:
+        raise HTTPException(status_code=404, detail="Token not found")
+    token_contract = tokens[tokenAddress]
+    approved = token_contract.allowanceOf(user_id, spender_id)
+    return {"approvedAmount": convert_to_float(approved)}
+
+@app.post("/swap", response_model=SwapResponse)
+def swap(request: SwapRequest):
+    if request.user_id not in users:
+        raise HTTPException(status_code=404, detail="User not found")
+    if request.sendTokenAddress not in tokens:
+        raise HTTPException(status_code=404, detail="Token not found")
+    if request.receiveTokenAddress not in tokens:
+        raise HTTPException(status_code=404, detail="Token not found")
+
+    sendTokenAddress = request.sendTokenAddress
+    receiveTokenAddress = request.receiveTokenAddress
+    sendAmount = request.sendAmount
+    receiveAmount = request.receiveAmount
+    user_id = request.user_id
+
+    sendTokenContract = tokens[sendTokenAddress]
+    receiveTokenContract = tokens[receiveTokenAddress]
+
+    
 
 # Run the server using the command: uvicorn main:app --reload
