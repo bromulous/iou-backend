@@ -66,6 +66,7 @@ class BondState(Enum):
     ACTIVITY_HALTED = 3
     BOND_CANCELLED = 4
     BOND_ENDED = 5
+    BOND_ERROR = 6
 
 class LauncherBondContract:
     def __init__(self):
@@ -593,8 +594,8 @@ class BondContract(ERC20Snapshot):
             return BondState.BOND_ENDED
         if self._is_bond_cancelled():
             return BondState.BOND_CANCELLED
+        return BondState.BOND_ERROR
         
-        return BondState.AUCTION_NOT_STARTED
 
     @reentrancy_protection
     def purchase_bond(self, buyer, payment_token_amount, bond_token_amount):
