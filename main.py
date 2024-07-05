@@ -1074,7 +1074,7 @@ class TotalIssuerOwes(BaseModel):
 class PublishedBondDetails(BaseModel):
     contract_address: str
     issuer: str
-    total_supply: int
+    total_supply: float
     project_info: ProjectInfo
     bond_details: BondDetails
     auction_schedule: AuctionSchedule
