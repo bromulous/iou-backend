@@ -1345,7 +1345,7 @@ def issue_bond(user_id: str, request: SaveDraftRequest):
     )
     tokens[bond_contract.contract_address] = bond_contract
     # TODO: delete the draft
-
+    del projects[draft_id]
     return {"bond_id": bond_id}
 
 def calculate_apr(future_value, present_value, days=0, months=0, years=0):
