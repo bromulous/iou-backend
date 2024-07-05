@@ -388,12 +388,12 @@ class BondContract(ERC20Snapshot):
             return 0
         start_block = self.auction_end_block
         if len(self.snapshots) > 1:
-            start_block = self.snapshots[-1]
+            start_block = self.snapshots[-2]
         end_snapshot = self.auction_end_block + self.bond_repayment.bondTotalDurationBlocks
         snapshot_block = min(snapshot_block, end_snapshot)
         if start_block >= snapshot_block:
             return 0
-        total_amount = self.total_supply * self.bond_details.tokenPrice
+        total_amount = (self.total_supply * self.bond_details.tokenPrice) / 10**18
         if self.bond_repayment.paymentSchedule == "fixed":
             interest_due = self._get_apr_amount_for_block_window(
                 total_amount=total_amount,
@@ -478,7 +478,7 @@ class BondContract(ERC20Snapshot):
         return self.payments[self.payments_index[snapshot_block]]
     
     def _get_apr_per_block(self, total_amount, interest_rate):
-        apr_amount = (interest_rate * total_amount) // 100
+        apr_amount = (interest_rate * total_amount) // 10**20
         return apr_amount // (5760 * 365)
     
     def _get_apr_amount_for_block_window(self, total_amount, interest_rate, start_block, end_block):
@@ -490,14 +490,14 @@ class BondContract(ERC20Snapshot):
     
     def get_amount_owed_for_snapshot(self, snapshot_block):
         if snapshot_block not in self.snapshot_balances:
-            return 0
+            return [0,0]
         curr_block = get_current_block()
 
-        payment_info = self._get_payment_for_block(snapshot_block)
+        payment_info: PaymentStruct = self._get_payment_for_block(snapshot_block)
         amount_due = payment_info.total_amount - payment_info.total_allocated
         if amount_due <= 0:
-            return 0
-        payment_due_block = snapshot_block + 5760 * 7 
+            return [0, 0]
+        payment_due_block = snapshot_block + 5760 * 1
         penalty_amount_remaining = 0
         if curr_block > payment_due_block and self.bond_repayment.latePenalty > 0:
             # The issuer has 7 days to allocate funds to the snapshot
@@ -536,17 +536,17 @@ class BondContract(ERC20Snapshot):
             raise RuntimeError("Bond is not live.")
         
         # Access the token instance using the token address
-        payment_token_instance = tokens[self.bond_details.paymentTokenAddress]
+        payment_token_instance: ERC20Token = tokens[self.bond_details.paymentTokenAddress]
         
         # Ensure the issuer has approved enough tokens for the contract to transfer
-        if payment_token_instance.allowance(self.issuer, self.bond_id) < amount:
+        if payment_token_instance.allowanceOf(self.issuer, self.contract_address) < amount:
             raise RuntimeError("Insufficient token approval.")
         
         # Transfer the tokens from issuer to contract
         # This might create an over payment situation
         # The overpayment will be allocated to the next snapshot
         # If the issuer realizes they have overpaid they can withdraw unallocated funds
-        if not payment_token_instance.transferFrom(self.issuer, self.bond_id, amount):
+        if not payment_token_instance.transferFrom(self.contract_address, self.issuer, self.contract_address, amount):
             raise RuntimeError("Transfer failed.")
         
         self._allocate_payments(amount)
@@ -590,7 +590,7 @@ class BondContract(ERC20Snapshot):
             self.overpayment = amount
             
         self.total_repaid += repaid
-        if self.total_repaid >= self.total_supply * self.bond_details.tokenPrice:
+        if self.total_repaid >= self.total_supply * self.bond_details.tokenPrice / 10**18:
             self.bond_end_block = get_current_block()
             
                 
@@ -608,7 +608,7 @@ class BondContract(ERC20Snapshot):
         if balance_at_snapshot == 0:
             return 0
         
-        payment_info = self._get_payment_for_block(snapshot_block)
+        payment_info: PaymentStruct = self._get_payment_for_block(snapshot_block)
         principal_percentage_owed = (payment_info.total_allocated * balance_at_snapshot) // self.total_supply
         penalty_percentage_owed = (payment_info.penalty_paid * balance_at_snapshot) // self.total_supply
         amount_already_claimed = payment_info.balances.get(holder, 0)
@@ -657,12 +657,12 @@ class BondContract(ERC20Snapshot):
             available_to_claim = principal_percentage_owed + penalty_percentage_owed - amount_already_claimed
             if available_to_claim == 0:
                 continue
-            payment.balances[holder] += available_to_claim
+            payment.balances[holder] = payment.balances.get(holder,0) + available_to_claim
             payment.total_claimed += available_to_claim
             total_claimed += available_to_claim
         # Transfer token to holder
-        payment_token_instance = tokens[self.bond_details.paymentTokenAddress]
-        if not payment_token_instance.transfer(self.bond_id, holder, total_claimed):
+        payment_token_instance: ERC20Token = tokens[self.bond_details.paymentTokenAddress]
+        if not payment_token_instance.transfer(self.contract_address, holder, total_claimed):
             raise RuntimeError("Transfer failed.")
 
 
@@ -802,7 +802,7 @@ class BondContract(ERC20Snapshot):
             raise RuntimeError("Bond is not live.")
         if self.withdrawn_funds:
             return False
-        funds_token = tokens[self.bond_details.paymentTokenAddress]
+        funds_token: ERC20Token = tokens[self.bond_details.paymentTokenAddress]
         if not funds_token.transfer(self.contract_address, self.issuer, self.funds_from_bond_purchase):
             raise RuntimeError("Transfer failed.")
         self.withdrawn_funds = True
@@ -1078,6 +1078,8 @@ class PublishedBondDetails(BaseModel):
     auction_schedule: AuctionSchedule
     bond_repayment: BondRepayment
     activity_halted: bool
+    withdrawn_funds: bool
+    funds_from_bond_purchase: float
 
     auction_start_block: int
     auction_end_block: int
@@ -1086,7 +1088,7 @@ class PublishedBondDetails(BaseModel):
     bond_end_date: str
     auction_end_date: str
 
-    overpayment: int
+    overpayment: float
 
     # Computed properties
     current_block: int
@@ -1469,6 +1471,8 @@ def build_bond_details_from_bond(bond: BondContract, user_id: str):
         auction_schedule=convert_auction_dataclass_to_schedule_basemodel(bond.auction_schedule),
         bond_repayment=convert_bond_dataclass_to_repayment_basemodel(bond.bond_repayment),
         activity_halted=bond.activity_halted,
+        withdrawn_funds = bond.withdrawn_funds,
+        funds_from_bond_purchase=convert_to_float(bond.funds_from_bond_purchase),
         auction_start_block=bond.auction_start_block,
         auction_end_block=bond.auction_end_block,
         bond_end_block=bond.bond_end_block,
@@ -1604,17 +1608,17 @@ def end_auction(user_id: str, bond_id: str):
     return {"message": "Auction not yet ended"}
 
 @app.post("/users/{user_id}/withdraw_funds/{bond_id}")
-def withdraw_funds(user_id: str, bond_id: str, amount: float):
+def withdraw_funds(user_id: str, bond_id: str):
     if user_id not in users:
         raise HTTPException(status_code=404, detail="User not found")
     if bond_id not in launcher_contract.bonds:
         raise HTTPException(status_code=404, detail="Bond not found")
 
-    bond_contract = launcher_contract.bonds[bond_id]
+    bond_contract: BondContract = launcher_contract.bonds[bond_id]
     if bond_contract.issuer != user_id:
         raise HTTPException(status_code=403, detail="Only the issuer can withdraw funds")
 
-    if not bond_contract.withdraw_funds(user_id, convert_to_integer(amount)):
+    if not bond_contract.withdraw_funds(user_id):
         raise HTTPException(status_code=400, detail="Withdrawal failed")
     return {"message": "Funds withdrawn successfully"}
 
@@ -1634,9 +1638,9 @@ def claim_payment(bond_id: str, holder: str):
     if bond_id not in launcher_contract.bonds:
         raise HTTPException(status_code=404, detail="Bond not found")
 
-    bond_contract = launcher_contract.bonds[bond_id]
+    bond_contract:BondContract = launcher_contract.bonds[bond_id]
     try:
-        total_claimed = bond_contract.claim_payment(holder)
+        total_claimed = bond_contract.claim_payments(holder)
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -1760,7 +1764,7 @@ def deposit_payment(bond_id: str, amount: float):
     if bond_id not in launcher_contract.bonds:
         raise HTTPException(status_code=404, detail="Bond not found")
 
-    bond_contract = launcher_contract.bonds[bond_id]
+    bond_contract: BondContract = launcher_contract.bonds[bond_id]
     try:
         bond_contract.deposit_payment(convert_to_integer(amount))
     except RuntimeError as e:
