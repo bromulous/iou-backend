@@ -1,4 +1,6 @@
 from math import exp
+from tracemalloc import start
+from turtle import st
 from fastapi.exceptions import RequestValidationError
 import logging
 from fastapi import FastAPI, HTTPException, Request
@@ -463,6 +465,45 @@ class BondContract(ERC20Snapshot):
         )
         self.snapshot_bounty[snapshot_block] = caller
         return snapshot_block
+    
+    def get_expected_snapshot_details(self, caller):
+        token_balance = self.balanceOf(caller)
+        start_block = self.auction_end_block
+        status = self.get_bond_status()
+        if status == BondState.AUCTION_LIVE or status == BondState.AUCTION_NOT_STARTED:
+            start_block = get_current_block()
+        end_block = start_block + self.bond_repayment.bondTotalDurationBlocks
+        snapshot_block = start_block
+        blocks_between_snapshots =  self.convert_date_to_blocks(**asdict(self.bond_repayment.fixedPaymentInterval))
+        number_of_snapshots = self.bond_repayment.bondTotalDurationBlocks // blocks_between_snapshots 
+        total_amount = (self.bond_details.tokens * self.bond_details.tokenPrice) // 10**18
+        expected_snapshots = []
+        for i in range(number_of_snapshots):
+            start_block = snapshot_block
+            snapshot_block += blocks_between_snapshots
+            snapshot_block = min(snapshot_block, end_block)
+            interest_due = self._get_apr_amount_for_block_window(
+                total_amount=total_amount,
+                interest_rate=self.bond_details.interestRate,
+                start_block=start_block,
+                end_block=snapshot_block
+            )
+            principal_due = 0
+            if self.bond_repayment.paymentSchedule == "fixed":
+                if self.bond_repayment.repaymentType == "interest-only" and i == number_of_snapshots - 1:
+                    # If it's an interest-only bond, the principal is due at the end
+                    principal_due = total_amount
+                if self.bond_repayment.repaymentType == "principal-interest":
+                    elapsed_blocks = snapshot_block - start_block
+                    principal_per_block = total_amount // (self.bond_repayment.bondTotalDurationBlocks)
+                    principal_due = elapsed_blocks * principal_per_block
+            expected_snapshots.append([snapshot_block, principal_due, interest_due, token_balance])
+        return expected_snapshots
+    
+    def get_expanded_snapshot_details(self, caller):
+        snapshot_details = []
+        pass
+        
     
     @only_issuer
     def cancel_bond(self, issuer, is_cancelled = True):
@@ -1071,6 +1112,21 @@ class TotalIssuerOwes(BaseModel):
     total_principal_owed: float
     total_penalty_owed: float
 
+class ExpectedSnapshotDetails(BaseModel):
+    snapshot_block: int
+    principal_due: float
+    interest_due: float
+    token_balance: float
+    date: str
+
+@dataclass
+class ExpectedSnapshotDetailsStruct():
+    snapshot_block: int
+    principal_due: int
+    interest_due: int
+    token_balance: int
+    
+
 class PublishedBondDetails(BaseModel):
     contract_address: str
     issuer: str
@@ -1103,6 +1159,7 @@ class PublishedBondDetails(BaseModel):
     bond_status: str
     current_auction_price: float
     apr : float
+    expected_snapshots_details: List[ExpectedSnapshotDetails]
 
 
 
@@ -1464,6 +1521,17 @@ def build_bond_details_from_bond(bond: BondContract, user_id: str):
     else:
         bond_end_date = ""
 
+    expected_snapshots_details = []
+    for elem in bond.get_expected_snapshot_details(user_id):
+        record = ExpectedSnapshotDetails(
+            snapshot_block=elem[0],
+            principal_due=convert_to_float(elem[1]),
+            interest_due=convert_to_float(elem[2]),
+            token_balance=convert_to_float(elem[3]),
+            date = convert_blocks_to_date_str(elem[0])
+        )
+        expected_snapshots_details.append(record)
+
     return PublishedBondDetails(
         contract_address=bond.contract_address,
         issuer=bond.issuer,
@@ -1494,7 +1562,8 @@ def build_bond_details_from_bond(bond: BondContract, user_id: str):
         bond_sold_out=bond.is_bond_sold_out(),
         bond_status=convert_bond_status_to_string(bond.get_bond_status()),
         current_auction_price=convert_to_float(bond.get_current_auction_price()),
-        apr=calculate_apr_from_bond(bond)
+        apr=calculate_apr_from_bond(bond),
+        expected_snapshots_details=expected_snapshots_details
     )
 
 
