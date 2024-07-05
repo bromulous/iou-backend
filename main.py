@@ -1,3 +1,4 @@
+from math import exp
 from fastapi.exceptions import RequestValidationError
 import logging
 from fastapi import FastAPI, HTTPException, Request
@@ -765,7 +766,8 @@ class BondContract(ERC20Snapshot):
         bond_tokens_to_transfer = min(bond_token_amount, expected_bond_token_amount)
         
         if not self.bond_details.infiniteTokens and self.bond_details.tokens - self.total_supply < bond_tokens_to_transfer:
-            raise RuntimeError("Insufficient bond inventory.")
+            bond_tokens_to_transfer = self.bond_details.tokens - self.total_supply
+            # raise RuntimeError("Insufficient bond inventory.")
 
         total_cost = bond_tokens_to_transfer * auction_price // 10**18
         
