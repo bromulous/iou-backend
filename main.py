@@ -1009,9 +1009,9 @@ class PublishedBondPreview(BaseModel):
     interest: float
     duration: BondDuration
     token_price: float
-    tokens: int
-    total_amount: int
-    total_supply: int
+    tokens: float
+    total_amount: float
+    total_supply: float
     auction_start_block: int
     auction_start_date: str
     auction_end_block: int
