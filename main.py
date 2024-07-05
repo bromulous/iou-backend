@@ -1,4 +1,3 @@
-from lib2to3.pytree import convert
 from fastapi.exceptions import RequestValidationError
 import logging
 from fastapi import FastAPI, HTTPException, Request
@@ -168,6 +167,7 @@ class SaveDraftRequestStruct:
 
 class ApproveRequest(BaseModel):
     user_id: str
+    spender: str
     amount: float
 
 class SwapRequest(BaseModel):
@@ -292,7 +292,7 @@ class ERC20Token:
         return self.allowances.get(owner, {}).get(spender, 0)
 
     def transferFrom(self, spender, owner, receiver, amount):
-        if self.allowances.get(owner, {}).get(spender, 0) >= amount and self.balances.get(owner, 0) >= amount:
+        if self.allowanceOf(owner, spender) >= amount and self.balanceOf(owner) >= amount:
             self.allowances[owner][spender] -= amount
             self.balances[owner] -= amount
             self.balances[receiver] = self.balances.get(receiver, 0) + amount
@@ -344,6 +344,8 @@ class BondContract(ERC20Snapshot):
         self.funds_from_bond_purchase = 0
 
         self.approved_payees = {}
+
+        self.reentrancy_guard = False
 
 
     def only_issuer(func):
@@ -751,7 +753,7 @@ class BondContract(ERC20Snapshot):
         if status != BondState.AUCTION_LIVE:
             raise RuntimeError("Auction is not live.")
 
-        expected_bond_token_amount = payment_token_amount // auction_price
+        expected_bond_token_amount = payment_token_amount * 10**18 // auction_price 
         if bond_token_amount < expected_bond_token_amount:
             raise ValueError("The number of bond tokens does not match the payment amount submitted at the current price.")
         
@@ -760,17 +762,18 @@ class BondContract(ERC20Snapshot):
         if not self.bond_details.infiniteTokens and self.bond_details.tokens - self.total_supply < bond_tokens_to_transfer:
             raise RuntimeError("Insufficient bond inventory.")
 
-        total_cost = bond_tokens_to_transfer * auction_price
+        total_cost = bond_tokens_to_transfer * auction_price // 10**18
         
-        payment_token = tokens[self.bond_details.paymentTokenAddress]
-        if payment_token.allowances.get(buyer, {}).get(self.bond_id, 0) < total_cost:
+        payment_token: ERC20Token = tokens[self.bond_details.paymentTokenAddress]
+        allowance = payment_token.allowanceOf(buyer, self.contract_address)
+        if allowance < total_cost:
             raise RuntimeError("Insufficient token approval.")
         
-        if not payment_token.transferFrom(buyer, self.bond_id, total_cost):
+        if not payment_token.transferFrom(self.contract_address, buyer, self.contract_address, total_cost):
             raise RuntimeError("Transfer failed.")
         
         self.total_supply += bond_tokens_to_transfer
-        self.balances[buyer] += bond_tokens_to_transfer
+        self.balances[buyer] = self.balances.get(buyer,0) + bond_tokens_to_transfer
         self.funds_from_bond_purchase += total_cost
 
         if self.is_bond_sold_out():
@@ -1557,13 +1560,14 @@ def start_auction(user_id: str, bond_id: str, initial_price: float, duration: in
     return {"message": "Auction started"}
 
 @app.post("/purchase_bond/{bond_id}")
-def purchase_bond(user_id: str, bond_id: str, request: PurchaseRequest):
+def purchase_bond(bond_id: str, request: PurchaseRequest):
+    user_id = request.user_id
     if user_id not in users:
         raise HTTPException(status_code=404, detail="User not found")
     if bond_id not in launcher_contract.bonds:
         raise HTTPException(status_code=404, detail="Bond not found")
     
-    bond_contract = launcher_contract.bonds[bond_id]
+    bond_contract:BondContract = launcher_contract.bonds[bond_id]
     try:
         bond_contract.purchase_bond(user_id, convert_to_integer(request.payment_token_amount), convert_to_integer(request.bond_token_amount))
     except PermissionError as e:
@@ -1781,9 +1785,10 @@ def approve(tokenAddress: str, request: ApproveRequest):
     if tokenAddress not in tokens:
         raise HTTPException(status_code=404, detail="Token not found")
     user_id = request.user_id
+    spender = request.spender
     amount = request.amount
-    token_contract = tokens[tokenAddress]
-    token_contract.approve(user_id, convert_to_integer(amount))
+    token_contract: ERC20Token = tokens[tokenAddress]
+    token_contract.approve(user_id, spender, convert_to_integer(amount))
     return {"message": "Approval set successfully"}
 
 @app.get("/approved/{tokenAddress}")
