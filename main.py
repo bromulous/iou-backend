@@ -180,6 +180,10 @@ class SwapRequest(BaseModel):
 class SwapResponse(BaseModel):
     balances: Dict[str, float]
 
+class CreateSnapshotRequest(BaseModel):
+    bond_id: str
+    user_id: str
+
 class BondState(Enum):
     AUCTION_NOT_STARTED = 0
     AUCTION_LIVE = 1
@@ -389,11 +393,11 @@ class BondContract(ERC20Snapshot):
         snapshot_block = min(snapshot_block, end_snapshot)
         if start_block >= snapshot_block:
             return 0
-        total_amount = self.total_supply * self.bond_details.token_price
+        total_amount = self.total_supply * self.bond_details.tokenPrice
         if self.bond_repayment.paymentSchedule == "fixed":
             interest_due = self._get_apr_amount_for_block_window(
                 total_amount=total_amount,
-                interest_rate=self.bond_details.interest_rate,
+                interest_rate=self.bond_details.interestRate,
                 start_block=start_block,
                 end_block=snapshot_block
             )
@@ -441,7 +445,7 @@ class BondContract(ERC20Snapshot):
             raise RuntimeError("Bond is not live.")
         next_snapshot_block = self.next_eligible_snapshot()
         curr_block = get_current_block()
-        if curr_block <= next_snapshot_block:
+        if curr_block < next_snapshot_block:
             raise RuntimeError("Not yet eligible for snapshot.")
         snapshot_block = self._snapshot()
         payment_due = self._calculate_snapshot_payment_due(snapshot_block)
@@ -511,8 +515,8 @@ class BondContract(ERC20Snapshot):
         total_principal_owed = 0
         total_penalty_owed = 0
         for i in range(self.last_fully_paid_index + 1, len(self.payments)):
-            payment = self.payments[i]
-            principal, penalty = self.get_amount_owed_for_snapshot(payment["snapshot_block"])
+            payment: PaymentStruct = self.payments[i]
+            principal, penalty = self.get_amount_owed_for_snapshot(payment.snapshot_block)
             total_principal_owed += principal
             total_penalty_owed += penalty
         return (total_principal_owed, total_penalty_owed)
@@ -520,9 +524,9 @@ class BondContract(ERC20Snapshot):
     def get_total_owed_breakdown(self):
         total_owed = []
         for i in range(self.last_fully_paid_index + 1, len(self.payments)):
-            payment = self.payments[i]
-            principal, penalty = self.get_amount_owed_for_snapshot(payment["snapshot_block"])
-            total_owed += [[payment["snapshot_block"], principal, penalty]]
+            payment: PaymentStruct = self.payments[i]
+            principal, penalty = self.get_amount_owed_for_snapshot(payment.snapshot_block)
+            total_owed += [[payment.snapshot_block, principal, penalty]]
         return total_owed
     
     @reentrancy_protection
@@ -555,8 +559,8 @@ class BondContract(ERC20Snapshot):
         repaid = 0
         
         for i in range(self.last_fully_paid_index + 1, len(self.payments)):
-            payment = self.payments[i]
-            principal_due, penalty_due = self.get_amount_owed_for_snapshot(payment["snapshot_block"])
+            payment: PaymentStruct = self.payments[i]
+            principal_due, penalty_due = self.get_amount_owed_for_snapshot(payment.snapshot_block)
             penalty_payment_amount = 0
             principal_payment_amount = 0
             finished_payment = False
@@ -615,8 +619,8 @@ class BondContract(ERC20Snapshot):
     def get_amount_user_entitled_to(self, holder):
         amounts = []
         for i in range(len(self.payments)):
-            payment = self.payments[i]
-            snapshot_block = payment["snapshot_block"]
+            payment:PaymentStruct = self.payments[i]
+            snapshot_block = payment.snapshot_block
             amounts += [[snapshot_block] + self.get_amount_user_entitled_to_for_snapshot(holder, snapshot_block)]
         return amounts
 
@@ -643,7 +647,8 @@ class BondContract(ERC20Snapshot):
     def claim_payments(self, holder):
         total_claimed = 0
         for payment in self.payments:
-            balance_at_snapshot = self.balance_of_at(holder, payment["snapshot_block"])
+            payment: PaymentStruct
+            balance_at_snapshot = self.balance_of_at(holder, payment.snapshot_block)
             if balance_at_snapshot == 0:
                 continue
             principal_percentage_owed = (payment.total_allocated * balance_at_snapshot) // self.total_supply
@@ -841,7 +846,7 @@ class BondContract(ERC20Snapshot):
             intervals_passed = elapsed_blocks // adjustment_interval_blocks # Make sure that we don't divide by 0 in the contract
             price_interval_delta = 0
             if self.auction_schedule.adjustmentType == "percentage":
-                price_interval_delta = price * self.auction_schedule.AdjustmentDetailsStruct.rate
+                price_interval_delta = (price * self.auction_schedule.adjustmentDetails.rate)// 10**20
             elif self.auction_schedule.adjustmentType == "fixed":
                 price_interval_delta = self.auction_schedule.adjustmentDetails.amount
             price = max(price - (price_interval_delta * intervals_passed), self.auction_schedule.minPrice)
@@ -1084,6 +1089,7 @@ class PublishedBondDetails(BaseModel):
     overpayment: int
 
     # Computed properties
+    current_block: int
     next_eligible_snapshot: int
     total_issuers_owes: TotalIssuerOwes
     total_issuer_owes_break_down: List[IssuerOwedBreakdown]
@@ -1282,16 +1288,18 @@ def issue_bond(user_id: str, request: SaveDraftRequest):
     return {"bond_id": bond_id}
 
 def calculate_apr(future_value, present_value, days=0, months=0, years=0):
+    if present_value == 0:
+        return 0
     # Convert the total duration into years
     duration_years = years + (months / 12) + (days / 365)
-    
+    simple_interest = (future_value - present_value) / present_value
     # Calculate APR
-    apr = ((future_value / present_value) ** (1 / duration_years) - 1) * 100
+    apr = (simple_interest/duration_years) * 100
     return apr
 
 def calculate_apr_from_bond(bond: BondContract):
     status = bond.get_bond_status()
-    apr = bond.bond_details.interestRate
+    apr = convert_to_float(bond.bond_details.interestRate)
     if status == BondState.AUCTION_LIVE:
         auction_price = bond.get_current_auction_price()
         token_price = bond.bond_details.tokenPrice
@@ -1299,7 +1307,7 @@ def calculate_apr_from_bond(bond: BondContract):
         months = bond.bond_repayment.bondDuration.months
         years = bond.bond_repayment.bondDuration.years
         apr = calculate_apr(token_price, auction_price, days, months, years)
-        apr += bond.bond_details.interestRate
+        apr += convert_to_float(bond.bond_details.interestRate)
     return apr
 
 
@@ -1320,7 +1328,7 @@ def convert_bond_status_to_string(status: BondState):
 def build_bond_preview_from_bond(bond: BondContract):
 
     status = bond.get_bond_status()
-    apr = convert_to_float(calculate_apr_from_bond(bond))
+    apr = calculate_apr_from_bond(bond)
     if bond.auction_end_block != 0:
         bond_end_date = convert_blocks_to_date_str(bond.auction_end_block + bond.bond_repayment.bondTotalDurationBlocks)
     else:
@@ -1468,6 +1476,7 @@ def build_bond_details_from_bond(bond: BondContract, user_id: str):
         bond_end_date=bond_end_date,
         auction_end_date=convert_blocks_to_date_str(bond.auction_end_block),
         overpayment=convert_to_float(bond.overpayment),
+        current_block = get_current_block(),
         next_eligible_snapshot=bond.next_eligible_snapshot(),
         total_issuers_owes=TotalIssuerOwes(
             total_principal_owed=convert_to_float(total_issuer_owes[0]), 
@@ -1479,7 +1488,7 @@ def build_bond_details_from_bond(bond: BondContract, user_id: str):
         bond_sold_out=bond.is_bond_sold_out(),
         bond_status=convert_bond_status_to_string(bond.get_bond_status()),
         current_auction_price=convert_to_float(bond.get_current_auction_price()),
-        apr=convert_to_float(calculate_apr_from_bond(bond))
+        apr=calculate_apr_from_bond(bond)
     )
 
 
@@ -1733,13 +1742,14 @@ def set_auction_price(user_id: str, bond_id: str, request: SetPriceRequest):
     return {"message": "Auction price set successfully"}
 
 @app.post("/bonds/{bond_id}/create_snapshot")
-def create_snapshot(bond_id: str, caller: str):
+def create_snapshot(bond_id:str, request: CreateSnapshotRequest):
+    user_id = request.user_id
     if bond_id not in launcher_contract.bonds:
         raise HTTPException(status_code=404, detail="Bond not found")
 
-    bond_contract = launcher_contract.bonds[bond_id]
+    bond_contract: BondContract = launcher_contract.bonds[bond_id]
     try:
-        snapshot_block = bond_contract.create_snapshot(caller)
+        snapshot_block = bond_contract.create_snapshot(user_id)
     except RuntimeError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
