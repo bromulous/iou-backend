@@ -11,6 +11,8 @@ import secrets
 from dataclasses import dataclass, asdict
 from enum import Enum
 
+BLOCKS_PER_DAY = 24 * 60 * 4 # Hours * minutes * 4 = 15 seconds per block
+
 app = FastAPI()
 
 origins = [
@@ -60,6 +62,124 @@ dummy_user = {"id": "0x0000000000000000000000000000000000000000", "name": "Sam",
 users[dummy_user['id']] = dummy_user
 current_user_id = dummy_user['id']
 
+# Simulating Structs for passing data to the contract using dataclasses
+@dataclass
+class AuctionDurationStruct:
+    days: int
+    hours: int
+
+@dataclass
+class AdjustmentDetailsStruct:
+    intervalDays: int
+    intervalHours: int
+    amount: int
+    rate: int
+
+@dataclass
+class BondDurationStruct:
+    years: int
+    months: int
+    days: int
+
+@dataclass
+class FixedPaymentIntervalStruct:
+    days: int
+    months: int
+    years: int
+
+@dataclass
+class CustomRepaymentIntervalStruct:
+    days: int
+    months: int
+    years: int
+    principalPercent: int
+    interestPercent: int
+
+@dataclass
+class DateStruct:
+    hours: int
+    days: int
+    months: int
+    years: int
+
+@dataclass
+class PaymentStruct:
+    snapshot_block: int
+    total_amount: int
+    total_allocated: int
+    total_claimed: int
+    balances: Dict[str, int]
+    penalty_paid: int
+    snapshot_caller: str
+
+@dataclass
+class ProjectInfoStruct:
+    name: str
+    description: str
+    website: str
+    imageUrl: str
+    coinGeckoUrl: str
+
+@dataclass
+class AuctionScheduleStruct:
+    auctionType: str
+    auctionDuration: AuctionDurationStruct
+    auctionEndCondition: str
+    adjustAutomatically: bool
+    adjustmentType: str
+    adjustmentDetails: AdjustmentDetailsStruct
+    minPrice: int
+    startAutomatically: bool
+    startBlock: int
+    endBlock: int
+
+@dataclass
+class BondDetailsStruct:
+    title: str
+    totalAmount: int
+    infiniteTokens: bool
+    tokens: int
+    tokenPrice: int
+    tokenSymbol: str
+    interestRate: int
+    requiresFullSale: bool
+    earlyRepayment: bool
+    collateral: bool
+    paymentTokenAddress: str
+
+@dataclass
+class BondRepaymentStruct:
+    bondDuration: BondDurationStruct
+    bondTotalDurationBlocks: int
+    repaymentType: str
+    paymentSchedule: str
+    latePenalty: int
+    fixedPaymentInterval: FixedPaymentIntervalStruct
+    customRepaymentSchedule: List[CustomRepaymentIntervalStruct]
+
+@dataclass
+class SaveDraftRequestStruct:
+    project_info: ProjectInfoStruct
+    bond_details: BondDetailsStruct
+    auction_schedule: AuctionScheduleStruct
+    bond_repayment: BondRepaymentStruct
+    draft_id: Optional[str] = None
+
+
+class ApproveRequest(BaseModel):
+    user_id: str
+    amount: float
+
+class SwapRequest(BaseModel):
+    sendTokenAddress: str
+    receiveTokenAddress: str
+    sendAmount: float
+    receiveAmount: float
+    user_id: str
+
+class SwapResponse(BaseModel):
+    balances: Dict[str, float]
+
 class BondState(Enum):
     AUCTION_NOT_STARTED = 0
     AUCTION_LIVE = 1
@@ -68,6 +188,22 @@ class BondState(Enum):
     BOND_CANCELLED = 4
     BOND_ENDED = 5
     BOND_ERROR = 6
+
+class BlockChainState:
+    def __init__(self):
+        genesis_block = datetime.datetime(1970, 1, 1)
+        current_time = datetime.datetime.now()
+        elapsed_seconds = (current_time - genesis_block).total_seconds()
+        self.current_block = int(elapsed_seconds // 15) + block_offset
+
+    def advance_blocks(self, amount_to_advance):
+        self.current_block += amount_to_advance
+
+    def set_current_block(self, block_to_set):
+        self.current_block = block_to_set
+
+    def get_current_block(self):
+        return self.current_block
 
 class LauncherBondContract:
     def __init__(self):
@@ -85,7 +221,7 @@ class LauncherBondContract:
     def remove_multi_sig_owner(self, owner):
         self.multi_sig_owners.discard(owner)
 
-    def create_bond_contract(self, issuer, project_info, bond_details, auction_schedule, bond_repayment):
+    def create_bond_contract(self, issuer, project_info: ProjectInfoStruct, bond_details: BondDetailsStruct, auction_schedule: AuctionScheduleStruct, bond_repayment: BondRepaymentStruct):
         bond_contract = BondContract(
             issuer,
             project_info,
@@ -122,6 +258,8 @@ class LauncherBondContract:
 launcher_contract = LauncherBondContract()
 launcher_contract.add_multi_sig_owner(dummy_user['id'])
 
+# Blockchain State Instance
+blockchain_state = BlockChainState()
 # Classes for ERC20Token and Bond operations
 class ERC20Token:
     def __init__(self, name, symbol, total_supply):
@@ -179,13 +317,13 @@ class ERC20Snapshot(ERC20Token):
         return 0
 
 class BondContract(ERC20Snapshot):
-    def __init__(self, issuer, project_info, bond_details, auction_schedule, bond_repayment):
+    def __init__(self, issuer, project_info: ProjectInfoStruct, bond_details: BondDetailsStruct, auction_schedule: AuctionScheduleStruct, bond_repayment: BondRepaymentStruct):
         super().__init__(bond_details.title, bond_details.tokenSymbol, 0)
         self.issuer = issuer
-        self.project_info = project_info
-        self.bond_details = bond_details
-        self.auction_schedule = auction_schedule
-        self.bond_repayment = bond_repayment
+        self.project_info: ProjectInfoStruct = project_info
+        self.bond_details: BondDetailsStruct = bond_details
+        self.auction_schedule: AuctionScheduleStruct = auction_schedule
+        self.bond_repayment: BondRepaymentStruct = bond_repayment
         self.activity_halted = False
         
         # Bond state variables
@@ -318,6 +456,11 @@ class BondContract(ERC20Snapshot):
         )
         self.snapshot_bounty[snapshot_block] = caller
         return snapshot_block
+    
+    @only_issuer
+    def cancel_bond(self, issuer, is_cancelled = True):
+        # TODO: Need to actually set logic for checking whether the bond is eligible to be cancelled
+        self.bond_manually_cancelled = is_cancelled
     
     def _add_payment(self, payment):
         self.payments.append(payment)
@@ -577,7 +720,7 @@ class BondContract(ERC20Snapshot):
             or (auction_over and self.bond_details.requiresFullSale and not self.is_bond_sold_out())
 
     
-    def get_bond_status(self):
+    def get_bond_status(self) -> BondState:
         # states:
         # 0 - auction not started
         # 1 - auction started
@@ -586,6 +729,8 @@ class BondContract(ERC20Snapshot):
         # 4 - bond cancelled
         current_block = get_current_block()
         passed_auction_start_block = False
+        if self._is_bond_cancelled():
+            return BondState.BOND_CANCELLED
         if self.activity_halted:
             return BondState.ACTIVITY_HALTED
         if self._is_pre_auction():
@@ -596,8 +741,6 @@ class BondContract(ERC20Snapshot):
             return BondState.BOND_LIVE
         if self._is_bond_finished():    
             return BondState.BOND_ENDED
-        if self._is_bond_cancelled():
-            return BondState.BOND_CANCELLED
         return BondState.BOND_ERROR
         
 
@@ -742,6 +885,9 @@ class CreateTokenRequest(BaseModel):
     name: str
     symbol: str
     total_supply: float
+
+class UpdateBlocksByDaysRequest(BaseModel):
+    days_to_advance: str
 
 class AddFundsRequest(BaseModel):
     user_id: str
@@ -949,123 +1095,7 @@ class PublishedBondDetails(BaseModel):
 
 
 
-# Simulating Structs for passing data to the contract using dataclasses
-@dataclass
-class AuctionDurationStruct:
-    days: int
-    hours: int
 
-@dataclass
-class AdjustmentDetailsStruct:
-    intervalDays: int
-    intervalHours: int
-    amount: int
-    rate: int
-
-@dataclass
-class BondDurationStruct:
-    years: int
-    months: int
-    days: int
-
-@dataclass
-class FixedPaymentIntervalStruct:
-    days: int
-    months: int
-    years: int
-
-@dataclass
-class CustomRepaymentIntervalStruct:
-    days: int
-    months: int
-    years: int
-    principalPercent: int
-    interestPercent: int
-
-@dataclass
-class DateStruct:
-    hours: int
-    days: int
-    months: int
-    years: int
-
-@dataclass
-class PaymentStruct:
-    snapshot_block: int
-    total_amount: int
-    total_allocated: int
-    total_claimed: int
-    balances: Dict[str, int]
-    penalty_paid: int
-    snapshot_caller: str
-
-@dataclass
-class ProjectInfoStruct:
-    name: str
-    description: str
-    website: str
-    imageUrl: str
-    coinGeckoUrl: str
-
-@dataclass
-class AuctionScheduleStruct:
-    auctionType: str
-    auctionDuration: AuctionDurationStruct
-    auctionEndCondition: str
-    adjustAutomatically: bool
-    adjustmentType: str
-    adjustmentDetails: AdjustmentDetailsStruct
-    minPrice: int
-    startAutomatically: bool
-    startBlock: int
-    endBlock: int
-
-@dataclass
-class BondDetailsStruct:
-    title: str
-    totalAmount: int
-    infiniteTokens: bool
-    tokens: int
-    tokenPrice: int
-    tokenSymbol: str
-    interestRate: int
-    requiresFullSale: bool
-    earlyRepayment: bool
-    collateral: bool
-    paymentTokenAddress: str
-
-@dataclass
-class BondRepaymentStruct:
-    bondDuration: BondDurationStruct
-    bondTotalDurationBlocks: int
-    repaymentType: str
-    paymentSchedule: str
-    latePenalty: int
-    fixedPaymentInterval: FixedPaymentIntervalStruct
-    customRepaymentSchedule: List[CustomRepaymentIntervalStruct]
-
-@dataclass
-class SaveDraftRequestStruct:
-    project_info: ProjectInfoStruct
-    bond_details: BondDetailsStruct
-    auction_schedule: AuctionScheduleStruct
-    bond_repayment: BondRepaymentStruct
-    draft_id: Optional[str] = None
-
-
-class ApproveRequest(BaseModel):
-    user_id: str
-    amount: float
-
-class SwapRequest(BaseModel):
-    sendTokenAddress: str
-    receiveTokenAddress: str
-    sendAmount: float
-    receiveAmount: float
-    user_id: str
-
-class SwapResponse(BaseModel):
-    balances: Dict[str, float]
 
 # Helper Conversion Functions
 def convert_to_integer(amount: float, multiplier: int = 10**18) -> int:
@@ -1088,6 +1118,10 @@ def convert_blocks_to_date_str(block_number: int) -> datetime:
         return ""
     return (datetime.datetime(1970, 1, 1) + datetime.timedelta(days=block_number // 5760)).isoformat()
 
+def convert_days_to_blocks(days: float):
+    # Assumes 15 second blocks
+    return days * BLOCKS_PER_DAY
+
 def convert_payment_schedule(payment_schedule: List[PaymentScheduleItem]) -> List[Dict[str, int]]:
     return [
         {
@@ -1100,12 +1134,7 @@ def convert_payment_schedule(payment_schedule: List[PaymentScheduleItem]) -> Lis
     ]
 
 def get_current_block() -> int:
-    # Assuming a block time of 15 seconds
-    genesis_block = datetime.datetime(1970, 1, 1)
-    current_time = datetime.datetime.now()
-    elapsed_seconds = (current_time - genesis_block).total_seconds()
-    current_block = int(elapsed_seconds // 15) + block_offset
-    return current_block
+    return blockchain_state.get_current_block()
 
 def generate_ethereum_address() -> str:
     return '0x' + secrets.token_hex(20)
@@ -1271,7 +1300,7 @@ def calculate_apr_from_bond(bond: BondContract):
     return apr
 
 
-def convert_bond_status_to_string(status):
+def convert_bond_status_to_string(status: BondState):
     if status == BondState.AUCTION_NOT_STARTED:
         return "Pre-Auction"
     if status == BondState.AUCTION_LIVE:
@@ -1635,6 +1664,17 @@ def get_bond_details(bond_id: str, user_id:str):
 def get_current_block_info():
     current_block = get_current_block()
     return {"current_block": current_block}
+
+@app.post("/advance_current_block_by_blocks", response_model=Dict)
+def advance_current_block_by_blocks(amount_to_advance: int):
+    blockchain_state.advance_blocks(amount_to_advance)
+    return {"new_current_block": blockchain_state.get_current_block()}
+
+@app.post("/advance_current_block_by_days", response_model=Dict)
+def advance_current_block_by_days(update_blocks_by_days_request: UpdateBlocksByDaysRequest):
+    blocks_to_advance = convert_days_to_blocks(float(update_blocks_by_days_request.days_to_advance))
+    blockchain_state.advance_blocks(blocks_to_advance)
+    return {"new_current_block": blockchain_state.get_current_block()}
 
 # Read functions for bond status
 @app.get("/bonds/{bond_id}/current_price", response_model=Dict)
