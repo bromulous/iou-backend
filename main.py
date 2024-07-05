@@ -606,7 +606,7 @@ class BondContract(ERC20Snapshot):
     def get_amount_user_entitled_to_for_snapshot(self, holder, snapshot_block):
         balance_at_snapshot = self.balance_of_at(holder, snapshot_block)
         if balance_at_snapshot == 0:
-            return 0
+            return [0, 0, 0, 0]
         
         payment_info: PaymentStruct = self._get_payment_for_block(snapshot_block)
         principal_percentage_owed = (payment_info.total_allocated * balance_at_snapshot) // self.total_supply
@@ -751,7 +751,7 @@ class BondContract(ERC20Snapshot):
         return BondState.BOND_ERROR
         
 
-    @reentrancy_protection
+    # @reentrancy_protection
     def purchase_bond(self, buyer, payment_token_amount, bond_token_amount):
         auction_price = self.get_current_auction_price()
         status = self.get_bond_status()
